@@ -13,7 +13,7 @@ from PIL import Image, ImageTk
 # Placeholder for generating output file paths based on mouse ID
 def generate_file_paths(mouse_id, setup_index, root_dir):
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    animal_dir = os.path.join(root_dir, mouse_id, timestamp_str)
+    animal_dir = os.path.join(root_dir, mouse_id, "sleep_cam", timestamp_str)
     os.makedirs(animal_dir, exist_ok=True)
     video_path = os.path.join(animal_dir, f"setup{setup_index}.mp4")
     csv_path = os.path.join(animal_dir, f"setup{setup_index}.csv")
