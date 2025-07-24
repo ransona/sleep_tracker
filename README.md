@@ -1,4 +1,5 @@
 🛠️ Configuration Guide
+
 1. Create the Configuration File
 Create a file named configuration.txt in the same directory as the Python script.
 
@@ -23,6 +24,7 @@ COMPort: The COM port of the Arduino associated with that camera (e.g., COM3).
 Add as many setups as needed using [Setup2], [Setup3], etc.
 
 🧪 How the Program Works
+
 2. Startup Behavior
 Verifies the root directory exists. If not, prompts you to create it.
 
@@ -31,6 +33,7 @@ Checks each camera can be opened. If any cannot, it exits with an error.
 Warns once if any specified COM ports (Arduinos) are not available, and uses simulated input for those.
 
 🖥️ Using the GUI
+
 Components:
 Mouse ID: Text box to enter a unique ID for each mouse.
 
@@ -51,6 +54,7 @@ Auto Cycle: When enabled, automatically rotates through setups.
 Dwell (s): How many seconds to stay on each setup when auto cycling.
 
 📁 Output Structure
+
 When recording:
 
 Creates a directory:
@@ -63,6 +67,7 @@ setupX.mp4: The recorded video.
 setupX.csv: A log of timestamps and Arduino data.
 
 ⚠️ Notes
+
 You must manually stop each recording.
 
 Auto cycle is just for viewing — it does not affect recording logic.
