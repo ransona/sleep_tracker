@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import cv2
 import threading
 import time
@@ -29,14 +29,19 @@ class SimulatedArduino:
 
 class CameraSetup:
     def __init__(self, cam_id, com_port, root_dir):
+        print(f"[DEBUG] Initializing camera {cam_id}")
         self.cam_id = cam_id
         self.com_port = com_port
         self.root_dir = root_dir
         self.cap = cv2.VideoCapture(cam_id)
         try:
-            self.serial = serial.Serial(com_port, 9600, timeout=0.1)
+            if com_port is not None:
+                self.serial = serial.Serial(com_port, 9600, timeout=0.1)
+                print(f"[DEBUG] Arduino connected on {com_port}")
+            else:
+                raise serial.SerialException()
         except (serial.SerialException, FileNotFoundError):
-            messagebox.showwarning("Arduino Not Found", f"Could not open serial port {com_port}. Using simulated Arduino.")
+            print(f"[WARNING] Arduino not found on {com_port}. Using simulated Arduino.")
             self.serial = SimulatedArduino()
         self.recording = False
         self.writer = None
@@ -84,6 +89,7 @@ class CameraSetup:
 
 class App:
     def __init__(self, root):
+        print("[DEBUG] Starting application")
         self.root = root
         self.root.title("Multi-Camera Acquisition")
         self.setups = []
@@ -94,20 +100,45 @@ class App:
         self.auto_cycle_interval = 5
 
         self.load_config()
+        print("[DEBUG] Configuration loaded")
         self.build_gui()
+        print("[DEBUG] GUI built")
         self.update_video()
         self.auto_cycle_loop()
 
     def load_config(self):
+        print("[DEBUG] Reading configuration file...")
         config = configparser.ConfigParser()
         config.read('configuration.txt')
+        print("[DEBUG] Configuration file loaded.")
         self.root_dir = config['DEFAULT']['RootDirectory']
+        print(f"[DEBUG] Checking root directory: {self.root_dir}")
+        if not os.path.exists(self.root_dir):
+            print(f"[INFO] Root directory '{self.root_dir}' not found. Creating it.")
+            os.makedirs(self.root_dir)
+
         index = 0
         while f'Setup{index}' in config:
             cam_id = int(config[f'Setup{index}']['CameraID'])
             com_port = config[f'Setup{index}']['COMPort']
-            self.setups.append(CameraSetup(cam_id, com_port, self.root_dir))
+            print(f"[DEBUG] Setup{index}: Checking camera {cam_id} and COM port {com_port}")
+
+            cap = cv2.VideoCapture(cam_id)
+            if not cap.isOpened():
+                print(f"[ERROR] Setup{index}: Camera ID {cam_id} could not be opened. Skipping this setup.")
+                cap.release()
+                index += 1
+                continue
+            cap.release()
+
+            setup = CameraSetup(cam_id, com_port, self.root_dir)
+            self.setups.append(setup)
+            print(f"[DEBUG] Setup{index} initialized.")
             index += 1
+
+        if not self.setups:
+            print("[ERROR] No valid camera setups found. Exiting.")
+            self.root.quit()
 
     def build_gui(self):
         self.mouse_id_label = ttk.Label(self.root, text="Mouse ID:")
@@ -175,7 +206,6 @@ class App:
         if self.auto_cycle:
             self.next_setup()
         if self.running:
-            interval = self.auto_cycle_interval
             try:
                 interval = int(self.dwell_entry.get())
             except ValueError:

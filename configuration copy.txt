@@ -3,4 +3,8 @@ RootDirectory = C:/Temp/sleep_cams
 
 [Setup0]
 CameraID = 0
-COMPort = COM10
+COMPort = COM3
+
+[Setup1]
+CameraID = 1
+COMPort = COM4
