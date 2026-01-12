@@ -10,14 +10,61 @@ import configparser
 from datetime import datetime
 from PIL import Image, ImageTk
 
-# Placeholder for generating output file paths based on mouse ID
-def generate_file_paths(mouse_id, setup_index, root_dir):
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    animal_dir = os.path.join(root_dir, mouse_id, "sleep_cam", timestamp_str)
+def parse_bool(value, default=False):
+    """Return a best-effort bool from config text."""
+    if value is None:
+        return default
+    val = str(value).strip().lower()
+    if val in ("1", "true", "yes", "y", "on"):
+        return True
+    if val in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
+    """Generate output file paths inside the animal/expID directory."""
+    safe_mouse_id = mouse_id if mouse_id else "unknown"
+    animal_dir = os.path.join(root_dir, safe_mouse_id, exp_id)
     os.makedirs(animal_dir, exist_ok=True)
     video_path = os.path.join(animal_dir, f"setup{setup_index}.mp4")
     csv_path = os.path.join(animal_dir, f"setup{setup_index}.csv")
     return video_path, csv_path
+
+
+def create_exp_id(mouse_id, remote_repo):
+    """
+    Replicate the MATLAB newExpID logic:
+    - ensure animal directory exists on the remote repository
+    - find the first unused expID for today and create its directory.
+    """
+    safe_mouse_id = mouse_id if mouse_id else "unknown"
+    os.makedirs(remote_repo, exist_ok=True)
+    animal_dir = os.path.join(remote_repo, safe_mouse_id)
+    os.makedirs(animal_dir, exist_ok=True)
+
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    base_exp_number = 0
+    while True:
+        base_exp_number += 1
+        if base_exp_number < 10:
+            base_exp_number_str = f"0{base_exp_number}"
+        else:
+            base_exp_number_str = str(base_exp_number)
+        possible_exp_id = f"{current_date}_{base_exp_number_str}_{safe_mouse_id}"
+        candidate_dir = os.path.join(animal_dir, possible_exp_id)
+        if not os.path.exists(candidate_dir):
+            os.makedirs(candidate_dir, exist_ok=True)
+            return possible_exp_id, candidate_dir
+
+
+def append_exp_list(exp_list_dir, exp_id):
+    """Append expID and timestamp to the shared exp_list.txt file."""
+    exp_list_path = os.path.join(exp_list_dir, "exp_list.txt")
+    os.makedirs(exp_list_dir, exist_ok=True)
+    with open(exp_list_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([exp_id, datetime.now().isoformat()])
 
 # Simulated Arduino for fallback when real one is not found
 class SimulatedArduino:
@@ -28,11 +75,13 @@ class SimulatedArduino:
         return b""
 
 class CameraSetup:
-    def __init__(self, cam_id, com_port, root_dir):
+    def __init__(self, cam_id, com_port, root_dir, flip_horizontal=False, flip_vertical=False):
         print(f"[DEBUG] Initializing camera {cam_id}")
         self.cam_id = cam_id
         self.com_port = com_port
         self.root_dir = root_dir
+        self.flip_horizontal = flip_horizontal
+        self.flip_vertical = flip_vertical
         self.cap = cv2.VideoCapture(cam_id)
         try:
             if com_port is not None:
@@ -52,11 +101,11 @@ class CameraSetup:
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
 
-    def start_recording(self, mouse_id, session_duration):
+    def start_recording(self, mouse_id, session_duration, exp_id):
         self.mouse_id = mouse_id
         self.session_duration = session_duration
         self.start_time = time.time()
-        video_path, csv_path = generate_file_paths(mouse_id, self.cam_id, self.root_dir)
+        video_path, csv_path = generate_file_paths(mouse_id, exp_id, self.cam_id, self.root_dir)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -73,9 +122,17 @@ class CameraSetup:
         if self.csv_file:
             self.csv_file.close()
 
+    def apply_flips(self, frame):
+        if self.flip_horizontal:
+            frame = cv2.flip(frame, 1)
+        if self.flip_vertical:
+            frame = cv2.flip(frame, 0)
+        return frame
+
     def read_frame(self):
         ret, frame = self.cap.read()
         if ret:
+            frame = self.apply_flips(frame)
             if self.recording:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
@@ -112,6 +169,8 @@ class App:
         config.read('configuration.txt')
         print("[DEBUG] Configuration file loaded.")
         self.root_dir = config['DEFAULT']['RootDirectory']
+        self.remote_repo = config['DEFAULT'].get('RemoteRepository', r'\\ar-lab-nas1\\DataServer\\Remote_Repository')
+        self.exp_list_dir = config['DEFAULT'].get('ExperimentListDirectory', r'\\ar-lab-nas1\\DataServer\\Remote_Repository\\habituation')
         print(f"[DEBUG] Checking root directory: {self.root_dir}")
         if not os.path.exists(self.root_dir):
             print(f"[INFO] Root directory '{self.root_dir}' not found. Creating it.")
@@ -131,7 +190,10 @@ class App:
                 continue
             cap.release()
 
-            setup = CameraSetup(cam_id, com_port, self.root_dir)
+            flip_horizontal = parse_bool(config[f'Setup{index}'].get('FlipHorizontal', False))
+            flip_vertical = parse_bool(config[f'Setup{index}'].get('FlipVertical', False))
+
+            setup = CameraSetup(cam_id, com_port, self.root_dir, flip_horizontal=flip_horizontal, flip_vertical=flip_vertical)
             self.setups.append(setup)
             print(f"[DEBUG] Setup{index} initialized.")
             index += 1
@@ -215,6 +277,26 @@ class App:
     def toggle_auto_cycle(self):
         self.auto_cycle = self.auto_cycle_var.get()
 
+    def generate_and_register_exp(self, mouse_id):
+        try:
+            exp_id, remote_exp_dir = create_exp_id(mouse_id, self.remote_repo)
+        except Exception as exc:
+            print(f"[WARNING] Failed to create remote expID directory: {exc}")
+            fallback_suffix = f"{int(time.time())}"
+            exp_id = f"{datetime.now().strftime('%Y-%m-%d')}_local_{fallback_suffix}_{mouse_id or 'unknown'}"
+            remote_exp_dir = None
+        else:
+            try:
+                append_exp_list(self.exp_list_dir, exp_id)
+            except Exception as exc:
+                print(f"[WARNING] Failed to append experiment list for '{exp_id}': {exc}")
+        local_exp_dir = os.path.join(self.root_dir, mouse_id or "unknown", exp_id)
+        os.makedirs(local_exp_dir, exist_ok=True)
+        print(f"[INFO] Using expID '{exp_id}'. Local path: {local_exp_dir}")
+        if remote_exp_dir:
+            print(f"[INFO] Remote experiment directory: {remote_exp_dir}")
+        return exp_id, remote_exp_dir
+
     def start_recording(self):
         setup = self.setups[self.current_setup]
         mouse_id = self.mouse_id_entry.get()
@@ -222,7 +304,9 @@ class App:
             session_duration = int(self.duration_entry.get())
         except ValueError:
             session_duration = 0
-        setup.start_recording(mouse_id, session_duration)
+
+        exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
+        setup.start_recording(mouse_id, session_duration, exp_id)
 
     def stop_recording(self):
         self.setups[self.current_setup].stop_recording()
