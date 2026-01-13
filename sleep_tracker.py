@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
+from tkinter import messagebox
 import cv2
 import threading
 import time
@@ -47,10 +49,7 @@ def create_exp_id(mouse_id, remote_repo):
     base_exp_number = 0
     while True:
         base_exp_number += 1
-        if base_exp_number < 10:
-            base_exp_number_str = f"0{base_exp_number}"
-        else:
-            base_exp_number_str = str(base_exp_number)
+        base_exp_number_str = f"{base_exp_number:02d}"
         possible_exp_id = f"{current_date}_{base_exp_number_str}_{safe_mouse_id}"
         candidate_dir = os.path.join(animal_dir, possible_exp_id)
         if not os.path.exists(candidate_dir):
@@ -75,8 +74,10 @@ class SimulatedArduino:
         return b""
 
 class CameraSetup:
-    def __init__(self, cam_id, com_port, root_dir, flip_horizontal=False, flip_vertical=False):
-        print(f"[DEBUG] Initializing camera {cam_id}")
+    def __init__(self, cam_id, com_port, root_dir, flip_horizontal=False, flip_vertical=False, logger=None, name=None):
+        self.logger = logger
+        self._log("Initializing camera", level="DEBUG", suffix=f" {cam_id}")
+        self.name = name
         self.cam_id = cam_id
         self.com_port = com_port
         self.root_dir = root_dir
@@ -86,11 +87,11 @@ class CameraSetup:
         try:
             if com_port is not None:
                 self.serial = serial.Serial(com_port, 9600, timeout=0.1)
-                print(f"[DEBUG] Arduino connected on {com_port}")
+                self._log(f"Arduino connected on {com_port}", level="DEBUG")
             else:
                 raise serial.SerialException()
         except (serial.SerialException, FileNotFoundError):
-            print(f"[WARNING] Arduino not found on {com_port}. Using simulated Arduino.")
+            self._log(f"Arduino not found on {com_port}. Using simulated Arduino.", level="WARNING")
             self.serial = SimulatedArduino()
         self.recording = False
         self.writer = None
@@ -100,6 +101,16 @@ class CameraSetup:
         self.elapsed_time = 0
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
+        self.exp_id = ""
+
+    def _log(self, message, level="INFO", suffix=""):
+        if self.logger:
+            self.logger(message + suffix, level=level)
+        else:
+            if level == "DEBUG":
+                print(f"{message}{suffix}")
+            else:
+                print(f"[{level}] {message}{suffix}")
 
     def start_recording(self, mouse_id, session_duration, exp_id):
         self.mouse_id = mouse_id
@@ -146,9 +157,9 @@ class CameraSetup:
 
 class App:
     def __init__(self, root):
-        print("[DEBUG] Starting application")
         self.root = root
         self.root.title("Multi-Camera Acquisition")
+        self.root.state("zoomed")
         self.setups = []
         self.current_setup = 0
         self.running = True
@@ -156,35 +167,40 @@ class App:
         self.auto_cycle = False
         self.auto_cycle_interval = 5
 
+        self.status_dialog = None
+        self.status_text = None
+        self.create_status_dialog()
+        self.log("Starting application", level="DEBUG")
         self.load_config()
-        print("[DEBUG] Configuration loaded")
+        self.log("Configuration loaded", level="DEBUG")
         self.build_gui()
-        print("[DEBUG] GUI built")
+        self.log("GUI built", level="DEBUG")
+        self.close_status_dialog()
         self.update_video()
         self.auto_cycle_loop()
 
     def load_config(self):
-        print("[DEBUG] Reading configuration file...")
+        self.log("Reading configuration file...", level="DEBUG")
         config = configparser.ConfigParser()
         config.read('configuration.txt')
-        print("[DEBUG] Configuration file loaded.")
+        self.log("Configuration file loaded.", level="DEBUG")
         self.root_dir = config['DEFAULT']['RootDirectory']
         self.remote_repo = config['DEFAULT'].get('RemoteRepository', r'\\ar-lab-nas1\\DataServer\\Remote_Repository')
         self.exp_list_dir = config['DEFAULT'].get('ExperimentListDirectory', r'\\ar-lab-nas1\\DataServer\\Remote_Repository\\habituation')
-        print(f"[DEBUG] Checking root directory: {self.root_dir}")
+        self.log(f"Checking root directory: {self.root_dir}", level="DEBUG")
         if not os.path.exists(self.root_dir):
-            print(f"[INFO] Root directory '{self.root_dir}' not found. Creating it.")
+            self.log(f"Root directory '{self.root_dir}' not found. Creating it.", level="INFO")
             os.makedirs(self.root_dir)
 
         index = 0
         while f'Setup{index}' in config:
             cam_id = int(config[f'Setup{index}']['CameraID'])
             com_port = config[f'Setup{index}']['COMPort']
-            print(f"[DEBUG] Setup{index}: Checking camera {cam_id} and COM port {com_port}")
+            self.log(f"Setup{index}: Checking camera {cam_id} and COM port {com_port}", level="DEBUG")
 
             cap = cv2.VideoCapture(cam_id)
             if not cap.isOpened():
-                print(f"[ERROR] Setup{index}: Camera ID {cam_id} could not be opened. Skipping this setup.")
+                self.log(f"Setup{index}: Camera ID {cam_id} could not be opened. Skipping this setup.", level="ERROR")
                 cap.release()
                 index += 1
                 continue
@@ -193,30 +209,98 @@ class App:
             flip_horizontal = parse_bool(config[f'Setup{index}'].get('FlipHorizontal', False))
             flip_vertical = parse_bool(config[f'Setup{index}'].get('FlipVertical', False))
 
-            setup = CameraSetup(cam_id, com_port, self.root_dir, flip_horizontal=flip_horizontal, flip_vertical=flip_vertical)
+            setup_name = config[f"Setup{index}"].get("Name") or config[f"Setup{index}"].get("SetupName")
+            if not setup_name:
+                setup_name = f"Setup {index + 1}"
+            setup = CameraSetup(
+                cam_id,
+                com_port,
+                self.root_dir,
+                flip_horizontal=flip_horizontal,
+                flip_vertical=flip_vertical,
+                logger=self.log,
+                name=setup_name
+            )
             self.setups.append(setup)
-            print(f"[DEBUG] Setup{index} initialized.")
+            self.log(f"Setup{index} initialized.", level="DEBUG")
             index += 1
 
         if not self.setups:
-            print("[ERROR] No valid camera setups found. Exiting.")
+            self.log("No valid camera setups found. Exiting.", level="ERROR")
             self.root.quit()
 
+    def create_status_dialog(self):
+        self.status_dialog = tk.Toplevel(self.root)
+        self.status_dialog.title("Initializing")
+        screen_w = max(1, self.root.winfo_screenwidth())
+        screen_h = max(1, self.root.winfo_screenheight())
+        dialog_w = max(300, int(screen_w * 0.2))
+        dialog_h = max(200, int(screen_h * 0.2))
+        x = max(0, (screen_w - dialog_w) // 2)
+        y = max(0, (screen_h - dialog_h) // 2)
+        self.status_dialog.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+        self.status_dialog.transient(self.root)
+        label = ttk.Label(self.status_dialog, text="Initializing, please wait...")
+        label.pack(padx=10, pady=(10, 0))
+        list_frame = ttk.Frame(self.status_dialog)
+        list_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        self.status_text = tk.Listbox(list_frame)
+        self.status_text.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.status_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.status_text.config(yscrollcommand=scrollbar.set)
+        self.status_dialog.update()
+
+    def close_status_dialog(self):
+        if self.status_dialog is not None:
+            self.status_dialog.destroy()
+            self.status_dialog = None
+            self.status_text = None
+
+    def log(self, message, level="INFO"):
+        if level == "DEBUG":
+            line = message
+        else:
+            line = f"[{level}] {message}"
+        print(line)
+        if self.status_text is not None and self.status_dialog is not None:
+            self.status_text.insert("end", line)
+            self.status_text.see("end")
+            self.status_dialog.update()
+
     def build_gui(self):
-        self.mouse_id_label = ttk.Label(self.root, text="Mouse ID:")
+        default_font = tkfont.nametofont("TkDefaultFont")
+        self.root.update_idletasks()
+        screen_height = max(1, self.root.winfo_screenheight())
+        base_size = max(1, abs(default_font.actual()["size"]))
+        scaled_size = max(base_size, int(screen_height * 0.035))
+        large_font = tkfont.Font(
+            family=default_font.actual()["family"],
+            size=scaled_size
+        )
+        self.large_font = large_font
+
+        self.mouse_id_label = ttk.Label(self.root, text="Mouse ID:", font=large_font)
         self.mouse_id_label.pack()
-        self.mouse_id_entry = ttk.Entry(self.root)
+        self.mouse_id_entry = ttk.Entry(self.root, font=large_font, justify="center")
         self.mouse_id_entry.pack()
 
         self.duration_label = ttk.Label(self.root, text="Session Duration (min):")
         self.duration_label.pack()
-        self.duration_entry = ttk.Entry(self.root)
+        self.duration_entry = ttk.Entry(self.root, justify="center")
         self.duration_entry.pack()
 
         self.video_panel = ttk.Label(self.root)
         self.video_panel.pack()
 
-        self.timer_label = ttk.Label(self.root, text="Elapsed: 0:00 | Remaining: 0:00")
+        self.setup_label = ttk.Label(self.root, text="Setup 1", font=large_font)
+        self.setup_label.pack()
+
+        self.timer_label = ttk.Label(
+            self.root,
+            text="Elapsed: 0:00 | Remaining: 0:00",
+            font=large_font
+        )
         self.timer_label.pack()
 
         control_frame = ttk.Frame(self.root)
@@ -256,10 +340,19 @@ class App:
         elapsed_str = f"{elapsed // 60}:{elapsed % 60:02d}"
         remaining_str = f"{remaining // 60}:{remaining % 60:02d}"
 
-        if setup.session_duration > 0 and elapsed > setup.session_duration * 60:
-            self.timer_label.config(text=f"Elapsed: {elapsed_str} | Remaining: {remaining_str}", foreground="red")
+        if not setup.recording:
+            color = "black"
+        elif remaining == 0 and setup.session_duration > 0:
+            color = "red"
+        elif remaining < 5 * 60 and setup.session_duration > 0:
+            color = "orange"
         else:
-            self.timer_label.config(text=f"Elapsed: {elapsed_str} | Remaining: {remaining_str}", foreground="black")
+            color = "green"
+
+        self.timer_label.config(
+            text=f"Elapsed: {elapsed_str} | Remaining: {remaining_str}",
+            foreground=color
+        )
 
         if self.running:
             self.root.after(30, self.update_video)
@@ -281,32 +374,44 @@ class App:
         try:
             exp_id, remote_exp_dir = create_exp_id(mouse_id, self.remote_repo)
         except Exception as exc:
-            print(f"[WARNING] Failed to create remote expID directory: {exc}")
-            fallback_suffix = f"{int(time.time())}"
-            exp_id = f"{datetime.now().strftime('%Y-%m-%d')}_local_{fallback_suffix}_{mouse_id or 'unknown'}"
+            self.log(f"Failed to create remote expID directory: {exc}", level="WARNING")
+            exp_id = f"{datetime.now().strftime('%Y-%m-%d')}_01_{mouse_id or 'unknown'}"
             remote_exp_dir = None
         else:
             try:
                 append_exp_list(self.exp_list_dir, exp_id)
             except Exception as exc:
-                print(f"[WARNING] Failed to append experiment list for '{exp_id}': {exc}")
+                self.log(f"Failed to append experiment list for '{exp_id}': {exc}", level="WARNING")
         local_exp_dir = os.path.join(self.root_dir, mouse_id or "unknown", exp_id)
         os.makedirs(local_exp_dir, exist_ok=True)
-        print(f"[INFO] Using expID '{exp_id}'. Local path: {local_exp_dir}")
+        self.log(f"Using expID '{exp_id}'. Local path: {local_exp_dir}", level="INFO")
         if remote_exp_dir:
-            print(f"[INFO] Remote experiment directory: {remote_exp_dir}")
+            self.log(f"Remote experiment directory: {remote_exp_dir}", level="INFO")
         return exp_id, remote_exp_dir
 
     def start_recording(self):
         setup = self.setups[self.current_setup]
-        mouse_id = self.mouse_id_entry.get()
+        mouse_id = self.mouse_id_entry.get().strip()
+        if not mouse_id:
+            messagebox.showerror("Missing Mouse ID", "Please enter a Mouse ID before starting.")
+            return
         try:
             session_duration = int(self.duration_entry.get())
         except ValueError:
             session_duration = 0
 
+        if session_duration == 0:
+            proceed = messagebox.askyesno(
+                "Session Duration",
+                "Session duration is set to 0 minutes. Continue anyway?"
+            )
+            if not proceed:
+                return
+
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
+        setup.exp_id = exp_id
         setup.start_recording(mouse_id, session_duration, exp_id)
+        self.update_setup_label()
 
     def stop_recording(self):
         self.setups[self.current_setup].stop_recording()
@@ -320,6 +425,12 @@ class App:
         self.save_current_setup_settings()
         self.current_setup = (self.current_setup + 1) % len(self.setups)
         self.load_current_setup_settings()
+
+    def update_setup_label(self):
+        setup = self.setups[self.current_setup]
+        exp_suffix = f": {setup.exp_id}" if setup.exp_id else ""
+        label_name = setup.name or f"Setup {self.current_setup + 1}"
+        self.setup_label.config(text=f"{label_name}{exp_suffix}")
 
     def save_current_setup_settings(self):
         setup = self.setups[self.current_setup]
@@ -335,6 +446,7 @@ class App:
         self.mouse_id_entry.insert(0, setup.mouse_id)
         self.duration_entry.delete(0, tk.END)
         self.duration_entry.insert(0, str(setup.session_duration))
+        self.update_setup_label()
 
     def on_closing(self):
         self.running = False

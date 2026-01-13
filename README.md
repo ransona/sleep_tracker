@@ -23,6 +23,8 @@ COMPort: The COM port of the Arduino associated with that camera (e.g., COM3).
 
 Add as many setups as needed using [Setup2], [Setup3], etc.
 
+python.exe C:\Users\ranso\OneDrive - UAB\Code\repos\sleep_tracker\file_check_generate.py "c:\Local_Repository" "habit" "True"
+
 🧪 How the Program Works
 
 2. Startup Behavior
