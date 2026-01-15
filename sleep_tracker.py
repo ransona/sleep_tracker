@@ -9,6 +9,7 @@ import serial
 import os
 import csv
 import configparser
+import winreg
 from datetime import datetime
 from PIL import Image, ImageTk
 
@@ -74,7 +75,17 @@ class SimulatedArduino:
         return b""
 
 class CameraSetup:
-    def __init__(self, cam_id, com_port, root_dir, flip_horizontal=False, flip_vertical=False, logger=None, name=None):
+    def __init__(
+        self,
+        cam_id,
+        com_port,
+        root_dir,
+        flip_horizontal=False,
+        flip_vertical=False,
+        logger=None,
+        name=None,
+        capture_factory=None
+    ):
         self.logger = logger
         self._log("Initializing camera", level="DEBUG", suffix=f" {cam_id}")
         self.name = name
@@ -83,7 +94,9 @@ class CameraSetup:
         self.root_dir = root_dir
         self.flip_horizontal = flip_horizontal
         self.flip_vertical = flip_vertical
-        self.cap = cv2.VideoCapture(cam_id)
+        if capture_factory is None:
+            capture_factory = cv2.VideoCapture
+        self.cap = capture_factory(cam_id)
         try:
             if com_port is not None:
                 self.serial = serial.Serial(com_port, 9600, timeout=0.1)
@@ -198,11 +211,11 @@ class App:
                 continue
             if "CameraID" not in config[section_name]:
                 continue
-            cam_id = int(config[section_name]["CameraID"])
+            cam_id = self.parse_camera_id(config[section_name]["CameraID"])
             com_port = config[section_name]["COMPort"]
             self.log(f"{section_name}: Checking camera {cam_id} and COM port {com_port}", level="DEBUG")
 
-            cap = cv2.VideoCapture(cam_id)
+            cap = self.open_capture(cam_id)
             if not cap.isOpened():
                 self.log(f"{section_name}: Camera ID {cam_id} could not be opened. Skipping this setup.", level="ERROR")
                 cap.release()
@@ -220,7 +233,8 @@ class App:
                 flip_horizontal=flip_horizontal,
                 flip_vertical=flip_vertical,
                 logger=self.log,
-                name=setup_name
+                name=setup_name,
+                capture_factory=self.open_capture
             )
             self.setups.append(setup)
             self.log(f"{section_name} initialized.", level="DEBUG")
@@ -268,6 +282,18 @@ class App:
             self.status_text.see("end")
             self.status_dialog.update()
 
+    def parse_camera_id(self, value):
+        text = str(value).strip()
+        try:
+            return int(text)
+        except ValueError:
+            return text
+
+    def open_capture(self, cam_id):
+        if isinstance(cam_id, int):
+            return cv2.VideoCapture(cam_id)
+        return cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+
     def build_gui(self):
         default_font = tkfont.nametofont("TkDefaultFont")
         self.root.update_idletasks()
@@ -304,7 +330,7 @@ class App:
         self.timer_label.pack()
 
         control_frame = ttk.Frame(self.root)
-        control_frame.pack()
+        control_frame.pack(fill="x")
 
         self.start_button = ttk.Button(control_frame, text="Start", command=self.start_recording)
         self.start_button.grid(row=0, column=0)
@@ -324,6 +350,9 @@ class App:
         self.dwell_entry = ttk.Entry(control_frame, width=5)
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=6)
+
+        self.show_cameras_button = ttk.Button(control_frame, text="Show Cameras", command=self.show_camera_streams)
+        self.show_cameras_button.grid(row=1, column=0, columnspan=8, pady=(10, 0))
         self.update_setup_label()
 
     def update_video(self):
@@ -432,6 +461,108 @@ class App:
         exp_suffix = f": {setup.exp_id}" if setup.exp_id else ""
         label_name = setup.name or f"Setup{self.current_setup}"
         self.setup_label.config(text=f"{label_name}{exp_suffix}")
+
+    def get_directshow_device_paths(self):
+        device_class_guid = "{e5323777-f976-4f5b-9b55-b94699c46e44}"
+        paths = []
+        try:
+            base_key = rf"SYSTEM\\CurrentControlSet\\Control\\DeviceClasses\\{device_class_guid}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_key) as key:
+                index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, index)
+                    except OSError:
+                        break
+                    paths.append(subkey_name)
+                    index += 1
+        except OSError as exc:
+            self.log(f"Failed to read DirectShow device paths: {exc}", level="WARNING")
+        return paths
+
+    def enumerate_camera_entries(self):
+        paths = self.get_directshow_device_paths()
+        max_index = min(16, max(4, len(paths)))
+        entries = []
+        for index in range(max_index):
+            cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                cap.release()
+                path = paths[index] if index < len(paths) else ""
+                entries.append({"id": index, "path": path})
+            else:
+                cap.release()
+        return entries
+
+    def show_camera_streams(self):
+        if hasattr(self, "camera_viewer") and self.camera_viewer is not None:
+            if self.camera_viewer.winfo_exists():
+                self.camera_viewer.lift()
+                return
+
+        entries = self.enumerate_camera_entries()
+        self.camera_viewer = tk.Toplevel(self.root)
+        self.camera_viewer.title("Available Cameras")
+        self.camera_viewer.geometry("1000x700")
+        self.camera_viewer.transient(self.root)
+
+        if not entries:
+            ttk.Label(self.camera_viewer, text="No cameras found.").pack(padx=20, pady=20)
+            return
+
+        self.camera_viewer_items = []
+        columns = 2
+        for idx, entry in enumerate(entries):
+            frame = ttk.Frame(self.camera_viewer)
+            row = idx // columns
+            col = idx % columns
+            frame.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+            self.camera_viewer.grid_columnconfigure(col, weight=1)
+            self.camera_viewer.grid_rowconfigure(row, weight=1)
+
+            label_text = f"Device {entry['id']}"
+            if entry["path"]:
+                label_text += f"\n{entry['path']}"
+            ttk.Label(frame, text=label_text, justify="center", wraplength=480).pack()
+            panel = ttk.Label(frame)
+            panel.pack(fill="both", expand=True)
+
+            cap = self.open_capture(entry["id"])
+            if not cap.isOpened():
+                panel.config(text="Unable to open camera stream.")
+                cap.release()
+                continue
+
+            self.camera_viewer_items.append({"cap": cap, "panel": panel})
+
+        self.camera_viewer.protocol("WM_DELETE_WINDOW", self.close_camera_viewer)
+        self.update_camera_viewer()
+
+    def update_camera_viewer(self):
+        if not hasattr(self, "camera_viewer") or self.camera_viewer is None:
+            return
+        if not self.camera_viewer.winfo_exists():
+            return
+        for item in self.camera_viewer_items:
+            cap = item["cap"]
+            panel = item["panel"]
+            ret, frame = cap.read()
+            if ret:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                imgtk = ImageTk.PhotoImage(image=img)
+                panel.imgtk = imgtk
+                panel.config(image=imgtk)
+        self.camera_viewer.after(100, self.update_camera_viewer)
+
+    def close_camera_viewer(self):
+        if hasattr(self, "camera_viewer_items"):
+            for item in self.camera_viewer_items:
+                item["cap"].release()
+            self.camera_viewer_items = []
+        if hasattr(self, "camera_viewer") and self.camera_viewer is not None:
+            self.camera_viewer.destroy()
+            self.camera_viewer = None
 
     def save_current_setup_settings(self):
         setup = self.setups[self.current_setup]
