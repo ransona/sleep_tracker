@@ -30,8 +30,8 @@ def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
     safe_mouse_id = mouse_id if mouse_id else "unknown"
     animal_dir = os.path.join(root_dir, safe_mouse_id, exp_id)
     os.makedirs(animal_dir, exist_ok=True)
-    video_path = os.path.join(animal_dir, f"setup{setup_index}.mp4")
-    csv_path = os.path.join(animal_dir, f"setup{setup_index}.csv")
+    video_path = os.path.join(animal_dir, f"{exp_id}_habit.mp4")
+    csv_path = os.path.join(animal_dir, f"{exp_id}_frame_times.csv")
     return video_path, csv_path
 
 
@@ -130,6 +130,9 @@ class CameraSetup:
         self.session_duration = session_duration
         self.start_time = time.time()
         video_path, csv_path = generate_file_paths(mouse_id, exp_id, self.cam_id, self.root_dir)
+        meta_path = os.path.join(os.path.dirname(video_path), f"{exp_id}_meta.txt")
+        with open(meta_path, "w", newline="") as meta_file:
+            meta_file.write(self.name or "")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
