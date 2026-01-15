@@ -75,3 +75,32 @@ You must manually stop each recording.
 Auto cycle is just for viewing — it does not affect recording logic.
 
 Each setup retains its own Mouse ID and session duration across switching.
+
+## Habituation watcher (server)
+`habituation_watcher.py` watches the shared experiment list and enqueues new IDs into the preprocessing queue via `preprocess_scripts/run_step1_batch.py`.
+
+Run:
+```
+python habituation_watcher.py --config habituation_watcher.yaml
+```
+
+Config example (`habituation_watcher.yaml`):
+- `experiment_list_path`: path to the shared `exp_list.txt` (CSV rows: expID,timestamp, no header).
+- `processed_list_path`: file tracking processed IDs (default `/data/common/habituation/already_processed.txt`).
+- `poll_interval_seconds`: seconds between polls (first poll runs immediately; default 60).
+- `log_path`: log file path (default `/data/common/habituation/habituation_watcher.log`).
+- `simulate`: true/false to log what would be enqueued without actually adding to the queue.
+
+Behavior:
+- Loads processed IDs (creates directories as needed).
+- Reads exp IDs from the CSV first column.
+- For each new ID, builds `step1_config` with:
+  - `userID` = current user
+  - `expIDs` = [expID]
+  - `suite2p_config` = ""
+  - `runs2p` = False
+  - `rundlc` = True
+  - `runfitpupil` = True
+  - `runhabituate` = True
+- Calls `run_step1_batch`, then records the ID as processed.
+- Logs to stdout and the log file.
