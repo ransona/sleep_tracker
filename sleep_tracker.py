@@ -335,27 +335,27 @@ class App:
         control_frame = ttk.Frame(self.root)
         control_frame.pack(fill="x")
 
-        self.start_button = ttk.Button(control_frame, text="Start", command=self.start_recording)
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack()
+
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_recording)
         self.start_button.grid(row=0, column=0)
-        self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_recording)
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording)
         self.stop_button.grid(row=0, column=1)
-        self.left_button = ttk.Button(control_frame, text="<", command=self.prev_setup)
+        self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup)
         self.left_button.grid(row=0, column=2)
-        self.right_button = ttk.Button(control_frame, text=">", command=self.next_setup)
+        self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup)
         self.right_button.grid(row=0, column=3)
 
         self.auto_cycle_var = tk.BooleanVar()
-        self.auto_cycle_button = ttk.Checkbutton(control_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle)
+        self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle)
         self.auto_cycle_button.grid(row=0, column=4)
 
-        self.dwell_label = ttk.Label(control_frame, text="Dwell (s):")
+        self.dwell_label = ttk.Label(button_frame, text="Dwell (s):")
         self.dwell_label.grid(row=0, column=5)
-        self.dwell_entry = ttk.Entry(control_frame, width=5)
+        self.dwell_entry = ttk.Entry(button_frame, width=5)
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=6)
-
-        self.show_cameras_button = ttk.Button(control_frame, text="Show Cameras", command=self.show_camera_streams)
-        self.show_cameras_button.grid(row=1, column=0, columnspan=8, pady=(10, 0))
         self.update_setup_label()
 
     def update_video(self):
