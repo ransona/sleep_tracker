@@ -3,13 +3,13 @@ RootDirectory = C:/Local_Repository
 RemoteRepository = \\ar-lab-nas1\\DataServer\\Remote_Repository
 ExperimentListDirectory = \\ar-lab-nas1\\DataServer\\Remote_Repository\\habituation
 
-[Setup0]
+[Top Left]
 CameraID = 0
 COMPort = COM10
 FlipHorizontal = False
 FlipVertical = False
 
-[Setup1]
+[Top Right]
 CameraID = 1
 COMPort = COM11
 FlipHorizontal = False

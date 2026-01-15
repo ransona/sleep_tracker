@@ -192,26 +192,27 @@ class App:
             self.log(f"Root directory '{self.root_dir}' not found. Creating it.", level="INFO")
             os.makedirs(self.root_dir)
 
-        index = 0
-        while f'Setup{index}' in config:
-            cam_id = int(config[f'Setup{index}']['CameraID'])
-            com_port = config[f'Setup{index}']['COMPort']
-            self.log(f"Setup{index}: Checking camera {cam_id} and COM port {com_port}", level="DEBUG")
+        section_names = config.sections()
+        for section_name in section_names:
+            if section_name.upper() == "DEFAULT":
+                continue
+            if "CameraID" not in config[section_name]:
+                continue
+            cam_id = int(config[section_name]["CameraID"])
+            com_port = config[section_name]["COMPort"]
+            self.log(f"{section_name}: Checking camera {cam_id} and COM port {com_port}", level="DEBUG")
 
             cap = cv2.VideoCapture(cam_id)
             if not cap.isOpened():
-                self.log(f"Setup{index}: Camera ID {cam_id} could not be opened. Skipping this setup.", level="ERROR")
+                self.log(f"{section_name}: Camera ID {cam_id} could not be opened. Skipping this setup.", level="ERROR")
                 cap.release()
-                index += 1
                 continue
             cap.release()
 
-            flip_horizontal = parse_bool(config[f'Setup{index}'].get('FlipHorizontal', False))
-            flip_vertical = parse_bool(config[f'Setup{index}'].get('FlipVertical', False))
+            flip_horizontal = parse_bool(config[section_name].get('FlipHorizontal', False))
+            flip_vertical = parse_bool(config[section_name].get('FlipVertical', False))
 
-            setup_name = config[f"Setup{index}"].get("Name") or config[f"Setup{index}"].get("SetupName")
-            if not setup_name:
-                setup_name = f"Setup {index + 1}"
+            setup_name = section_name
             setup = CameraSetup(
                 cam_id,
                 com_port,
@@ -222,8 +223,7 @@ class App:
                 name=setup_name
             )
             self.setups.append(setup)
-            self.log(f"Setup{index} initialized.", level="DEBUG")
-            index += 1
+            self.log(f"{section_name} initialized.", level="DEBUG")
 
         if not self.setups:
             self.log("No valid camera setups found. Exiting.", level="ERROR")
@@ -293,7 +293,7 @@ class App:
         self.video_panel = ttk.Label(self.root)
         self.video_panel.pack()
 
-        self.setup_label = ttk.Label(self.root, text="Setup 1", font=large_font)
+        self.setup_label = ttk.Label(self.root, text="", font=large_font)
         self.setup_label.pack()
 
         self.timer_label = ttk.Label(
@@ -324,6 +324,7 @@ class App:
         self.dwell_entry = ttk.Entry(control_frame, width=5)
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=6)
+        self.update_setup_label()
 
     def update_video(self):
         setup = self.setups[self.current_setup]
@@ -429,7 +430,7 @@ class App:
     def update_setup_label(self):
         setup = self.setups[self.current_setup]
         exp_suffix = f": {setup.exp_id}" if setup.exp_id else ""
-        label_name = setup.name or f"Setup {self.current_setup + 1}"
+        label_name = setup.name or f"Setup{self.current_setup}"
         self.setup_label.config(text=f"{label_name}{exp_suffix}")
 
     def save_current_setup_settings(self):
