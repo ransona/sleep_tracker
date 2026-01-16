@@ -102,7 +102,7 @@ class CameraSetup:
         self.cap = capture_factory(cam_id)
         try:
             if com_port is not None:
-                self.serial = serial.Serial(com_port, 9600, timeout=0.1, write_timeout=0.1)
+                self.serial = serial.Serial(com_port, 9600, timeout=0.1, write_timeout=1.0)
                 self._log(f"Arduino connected on {com_port}", level="DEBUG")
             else:
                 raise serial.SerialException()
@@ -120,6 +120,9 @@ class CameraSetup:
         self.exp_id = ""
         self.lock_state = "automatic"
         self.latest_status = None
+        self.last_arduino_line = ""
+        self.last_logged_arduino_line = ""
+        self.serial_lock = threading.Lock()
 
     def _log(self, message, level="INFO", suffix=""):
         if self.logger:
@@ -169,9 +172,11 @@ class CameraSetup:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
                 arduino_data = ""
-                if self.serial.in_waiting:
-                    arduino_data = self.serial.readline().decode().strip()
+                with self.serial_lock:
+                    if self.serial.in_waiting:
+                        arduino_data = self.serial.readline().decode().strip()
                     self.latest_status = self.parse_arduino_status(arduino_data)
+                    self.last_arduino_line = arduino_data
                 self.csv_writer.writerow([timestamp, arduino_data])
                 self.elapsed_time = int(timestamp)
             return frame
@@ -185,7 +190,7 @@ class CameraSetup:
         brake_text = "locked" if brake_raw == "0" else "unlocked" if brake_raw == "1" else brake_raw
         return (brake_text, wheel_pos, mode)
 
-    def send_lock_state(self):
+    def send_lock_state(self, log_fn=None):
         command_map = {
             "automatic": b"a",
             "locked": b"b",
@@ -195,12 +200,27 @@ class CameraSetup:
         if command is None:
             return
         def _send():
-            try:
-                self.serial.write(command)
-            except Exception as exc:
-                self._log(f"Failed to send lock state: {exc}", level="WARNING")
+            attempts = 0
+            while attempts < 3:
+                attempts += 1
+                try:
+                    with self.serial_lock:
+                        self.serial.write(command)
+                    if log_fn:
+                        log_fn(f"Sent lock state '{self.lock_state}' ({command.decode()})")
+                    return
+                except Exception as exc:
+                    self._log(self.format_serial_error(exc), level="WARNING")
+                    time.sleep(0.1)
+            self._log("Giving up after 3 send attempts.", level="WARNING")
 
         threading.Thread(target=_send, daemon=True).start()
+
+    def format_serial_error(self, exc):
+        is_open = getattr(self.serial, "is_open", None)
+        in_waiting = getattr(self.serial, "in_waiting", None)
+        out_waiting = getattr(self.serial, "out_waiting", None)
+        return f"Serial write failed: {exc} (is_open={is_open}, in_waiting={in_waiting}, out_waiting={out_waiting})"
 
 class App:
     def __init__(self, root):
@@ -339,6 +359,10 @@ class App:
             size=scaled_size
         )
         self.large_font = large_font
+        self.small_font = tkfont.Font(
+            family=default_font.actual()["family"],
+            size=base_size
+        )
 
         self.mouse_id_label = ttk.Label(self.root, text="Mouse ID:", font=large_font)
         self.mouse_id_label.pack()
@@ -355,6 +379,9 @@ class App:
 
         self.setup_label = ttk.Label(self.root, text="", font=large_font)
         self.setup_label.pack()
+
+        self.arduino_status_label = ttk.Label(self.root, text="", font=self.small_font)
+        self.arduino_status_label.pack()
 
         self.timer_label = ttk.Label(
             self.root,
@@ -390,6 +417,10 @@ class App:
 
         self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
         self.lock_state_button.grid(row=1, column=0, columnspan=7, pady=(10, 0))
+
+        self.debug_var = tk.BooleanVar()
+        self.debug_checkbox = ttk.Checkbutton(button_frame, text="Debug", variable=self.debug_var)
+        self.debug_checkbox.grid(row=1, column=7, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
 
@@ -402,6 +433,9 @@ class App:
             imgtk = ImageTk.PhotoImage(image=img)
             self.video_panel.imgtk = imgtk
             self.video_panel.config(image=imgtk)
+        if setup.recording and setup.last_arduino_line and setup.last_arduino_line != setup.last_logged_arduino_line:
+            self.debug_log(f"{setup.name}: {setup.last_arduino_line}")
+            setup.last_logged_arduino_line = setup.last_arduino_line
 
         elapsed = setup.elapsed_time if setup.recording else 0
         remaining = max(0, (setup.session_duration * 60) - elapsed)
@@ -480,7 +514,7 @@ class App:
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
         setup.exp_id = exp_id
         setup.start_recording(mouse_id, session_duration, exp_id)
-        setup.send_lock_state()
+        setup.send_lock_state(log_fn=self.debug_log)
         self.update_setup_label()
 
     def stop_recording(self):
@@ -505,6 +539,11 @@ class App:
             lock_text, wheel_pos, mode = setup.latest_status
             status_suffix = f" - {lock_text}, {wheel_pos}, mode: {mode}"
         self.setup_label.config(text=f"{label_name}{exp_suffix}{status_suffix}")
+        self.arduino_status_label.config(text=setup.last_arduino_line)
+
+    def debug_log(self, message):
+        if self.debug_var.get():
+            print(message)
 
     def update_lock_state_button(self):
         setup = self.setups[self.current_setup]
@@ -524,7 +563,7 @@ class App:
             setup.lock_state = "locked"
         else:
             setup.lock_state = "automatic"
-        setup.send_lock_state()
+        setup.send_lock_state(log_fn=self.debug_log)
         self.update_lock_state_button()
 
     def get_directshow_device_paths(self):
