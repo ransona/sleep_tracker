@@ -168,15 +168,16 @@ class CameraSetup:
         ret, frame = self.cap.read()
         if ret:
             frame = self.apply_flips(frame)
+            arduino_data = ""
+            with self.serial_lock:
+                if self.serial.in_waiting:
+                    arduino_data = self.serial.readline().decode().strip()
+                if arduino_data:
+                    self.latest_status = self.parse_arduino_status(arduino_data)
+                    self.last_arduino_line = arduino_data
             if self.recording:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
-                arduino_data = ""
-                with self.serial_lock:
-                    if self.serial.in_waiting:
-                        arduino_data = self.serial.readline().decode().strip()
-                    self.latest_status = self.parse_arduino_status(arduino_data)
-                    self.last_arduino_line = arduino_data
                 self.csv_writer.writerow([timestamp, arduino_data])
                 self.elapsed_time = int(timestamp)
             return frame
@@ -534,12 +535,12 @@ class App:
         setup = self.setups[self.current_setup]
         exp_suffix = f": {setup.exp_id}" if setup.exp_id else ""
         label_name = setup.name or f"Setup{self.current_setup}"
-        status_suffix = ""
+        status_line = ""
         if setup.latest_status:
             lock_text, wheel_pos, mode = setup.latest_status
-            status_suffix = f" - {lock_text}, {wheel_pos}, mode: {mode}"
-        self.setup_label.config(text=f"{label_name}{exp_suffix}{status_suffix}")
-        self.arduino_status_label.config(text=setup.last_arduino_line)
+            status_line = f"{lock_text}, {wheel_pos}, mode: {mode}"
+        self.setup_label.config(text=f"{label_name}{exp_suffix}")
+        self.arduino_status_label.config(text=status_line)
 
     def debug_log(self, message):
         if self.debug_var.get():
