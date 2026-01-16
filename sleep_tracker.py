@@ -102,7 +102,7 @@ class CameraSetup:
         self.cap = capture_factory(cam_id)
         try:
             if com_port is not None:
-                self.serial = serial.Serial(com_port, 9600, timeout=0.1)
+                self.serial = serial.Serial(com_port, 9600, timeout=0.1, write_timeout=0.1)
                 self._log(f"Arduino connected on {com_port}", level="DEBUG")
             else:
                 raise serial.SerialException()
@@ -194,10 +194,13 @@ class CameraSetup:
         command = command_map.get(self.lock_state)
         if command is None:
             return
-        try:
-            self.serial.write(command)
-        except Exception as exc:
-            self._log(f"Failed to send lock state: {exc}", level="WARNING")
+        def _send():
+            try:
+                self.serial.write(command)
+            except Exception as exc:
+                self._log(f"Failed to send lock state: {exc}", level="WARNING")
+
+        threading.Thread(target=_send, daemon=True).start()
 
 class App:
     def __init__(self, root):
