@@ -74,6 +74,9 @@ class SimulatedArduino:
     def readline(self):
         return b""
 
+    def write(self, _data):
+        return 0
+
 class CameraSetup:
     def __init__(
         self,
@@ -115,6 +118,8 @@ class CameraSetup:
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
         self.exp_id = ""
+        self.lock_state = "automatic"
+        self.latest_status = None
 
     def _log(self, message, level="INFO", suffix=""):
         if self.logger:
@@ -166,10 +171,33 @@ class CameraSetup:
                 arduino_data = ""
                 if self.serial.in_waiting:
                     arduino_data = self.serial.readline().decode().strip()
+                    self.latest_status = self.parse_arduino_status(arduino_data)
                 self.csv_writer.writerow([timestamp, arduino_data])
                 self.elapsed_time = int(timestamp)
             return frame
         return None
+
+    def parse_arduino_status(self, line):
+        parts = [part.strip() for part in line.split(";")]
+        if len(parts) != 3:
+            return None
+        brake_raw, wheel_pos, mode = parts
+        brake_text = "locked" if brake_raw == "0" else "unlocked" if brake_raw == "1" else brake_raw
+        return (brake_text, wheel_pos, mode)
+
+    def send_lock_state(self):
+        command_map = {
+            "automatic": b"a",
+            "locked": b"b",
+            "unlocked": b"c",
+        }
+        command = command_map.get(self.lock_state)
+        if command is None:
+            return
+        try:
+            self.serial.write(command)
+        except Exception as exc:
+            self._log(f"Failed to send lock state: {exc}", level="WARNING")
 
 class App:
     def __init__(self, root):
@@ -356,7 +384,11 @@ class App:
         self.dwell_entry = ttk.Entry(button_frame, width=5)
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=6)
+
+        self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
+        self.lock_state_button.grid(row=1, column=0, columnspan=7, pady=(10, 0))
         self.update_setup_label()
+        self.update_lock_state_button()
 
     def update_video(self):
         setup = self.setups[self.current_setup]
@@ -386,6 +418,7 @@ class App:
             text=f"Elapsed: {elapsed_str} | Remaining: {remaining_str}",
             foreground=color
         )
+        self.update_setup_label()
 
         if self.running:
             self.root.after(30, self.update_video)
@@ -444,6 +477,7 @@ class App:
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
         setup.exp_id = exp_id
         setup.start_recording(mouse_id, session_duration, exp_id)
+        setup.send_lock_state()
         self.update_setup_label()
 
     def stop_recording(self):
@@ -463,7 +497,32 @@ class App:
         setup = self.setups[self.current_setup]
         exp_suffix = f": {setup.exp_id}" if setup.exp_id else ""
         label_name = setup.name or f"Setup{self.current_setup}"
-        self.setup_label.config(text=f"{label_name}{exp_suffix}")
+        status_suffix = ""
+        if setup.latest_status:
+            lock_text, wheel_pos, mode = setup.latest_status
+            status_suffix = f" - {lock_text}, {wheel_pos}, mode: {mode}"
+        self.setup_label.config(text=f"{label_name}{exp_suffix}{status_suffix}")
+
+    def update_lock_state_button(self):
+        setup = self.setups[self.current_setup]
+        color_map = {
+            "automatic": ("Automatic", "blue", "white"),
+            "unlocked": ("Unlocked", "green", "white"),
+            "locked": ("Locked", "red", "white"),
+        }
+        label, bg, fg = color_map.get(setup.lock_state, ("Automatic", "blue", "white"))
+        self.lock_state_button.config(text=label, bg=bg, fg=fg)
+
+    def toggle_lock_state(self):
+        setup = self.setups[self.current_setup]
+        if setup.lock_state == "automatic":
+            setup.lock_state = "unlocked"
+        elif setup.lock_state == "unlocked":
+            setup.lock_state = "locked"
+        else:
+            setup.lock_state = "automatic"
+        setup.send_lock_state()
+        self.update_lock_state_button()
 
     def get_directshow_device_paths(self):
         device_class_guid = "{e5323777-f976-4f5b-9b55-b94699c46e44}"
@@ -582,6 +641,7 @@ class App:
         self.duration_entry.delete(0, tk.END)
         self.duration_entry.insert(0, str(setup.session_duration))
         self.update_setup_label()
+        self.update_lock_state_button()
 
     def on_closing(self):
         self.running = False
