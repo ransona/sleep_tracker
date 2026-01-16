@@ -166,15 +166,15 @@ class CameraSetup:
 
     def read_frame(self):
         ret, frame = self.cap.read()
+        arduino_data = ""
+        with self.serial_lock:
+            while self.serial.in_waiting:
+                arduino_data = self.serial.readline().decode().strip()
+            if arduino_data:
+                self.latest_status = self.parse_arduino_status(arduino_data)
+                self.last_arduino_line = arduino_data
         if ret:
             frame = self.apply_flips(frame)
-            arduino_data = ""
-            with self.serial_lock:
-                if self.serial.in_waiting:
-                    arduino_data = self.serial.readline().decode().strip()
-                if arduino_data:
-                    self.latest_status = self.parse_arduino_status(arduino_data)
-                    self.last_arduino_line = arduino_data
             if self.recording:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
