@@ -146,7 +146,7 @@ class CameraSetup:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter(video_path, fourcc, 20.0, (width, height))
+        self.writer = cv2.VideoWriter(video_path, fourcc, 10.0, (width, height))
         self.csv_file = open(csv_path, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'arduino_data'])
@@ -472,7 +472,7 @@ class App:
         self.update_setup_label()
 
         if self.running:
-            self.root.after(30, self.update_video)
+            self.root.after(100, self.update_video)
 
     def auto_cycle_loop(self):
         if self.auto_cycle:
