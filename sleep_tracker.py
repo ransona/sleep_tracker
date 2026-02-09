@@ -122,6 +122,8 @@ class CameraSetup:
         self.latest_status = None
         self.last_arduino_line = ""
         self.last_logged_arduino_line = ""
+        self.last_frame_ms = 0.0
+        self.last_serial_ms = 0.0
         self.serial_lock = threading.Lock()
 
     def _log(self, message, level="INFO", suffix=""):
@@ -165,19 +167,25 @@ class CameraSetup:
         return frame
 
     def read_frame(self):
+        frame_start = time.time()
         ret, frame = self.cap.read()
+        self.last_frame_ms = (time.time() - frame_start) * 1000.0
         arduino_data = ""
+        serial_start = time.time()
         with self.serial_lock:
             while self.serial.in_waiting:
                 arduino_data = self.serial.readline().decode().strip()
             if arduino_data:
                 self.latest_status = self.parse_arduino_status(arduino_data)
                 self.last_arduino_line = arduino_data
+        self.last_serial_ms = (time.time() - serial_start) * 1000.0
         if ret:
             frame = self.apply_flips(frame)
             if self.recording:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
+                if not arduino_data:
+                    arduino_data = self.last_arduino_line
                 self.csv_writer.writerow([timestamp, arduino_data])
                 self.elapsed_time = int(timestamp)
             return frame
@@ -428,6 +436,11 @@ class App:
     def update_video(self):
         setup = self.setups[self.current_setup]
         frame = setup.read_frame()
+        if self.debug_var.get():
+            self.debug_log(
+                f"{setup.name}: frame_read={setup.last_frame_ms:.1f}ms, "
+                f"serial_drain={setup.last_serial_ms:.1f}ms, frame_ok={frame is not None}"
+            )
         if frame is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
