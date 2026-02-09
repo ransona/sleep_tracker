@@ -137,7 +137,7 @@ class CameraSetup:
             else:
                 print(f"[{level}] {message}{suffix}")
 
-    def start_recording(self, mouse_id, session_duration, exp_id):
+    def start_recording(self, mouse_id, session_duration, exp_id, record_fps=10.0):
         self.mouse_id = mouse_id
         self.session_duration = session_duration
         self.start_time = time.time()
@@ -148,7 +148,7 @@ class CameraSetup:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter(video_path, fourcc, 10.0, (width, height))
+        self.writer = cv2.VideoWriter(video_path, fourcc, record_fps, (width, height))
         self.csv_file = open(csv_path, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'arduino_data'])
@@ -250,6 +250,8 @@ class App:
         self.last_elapsed = 0
         self.auto_cycle = False
         self.auto_cycle_interval = 5
+        self.record_fps = 10.0
+        self.frame_interval_ms = int(1000.0 / self.record_fps)
 
         self.status_dialog = None
         self.status_text = None
@@ -438,6 +440,14 @@ class App:
         self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
         self.lock_state_button.grid(row=1, column=0, columnspan=7, pady=(10, 0))
 
+        self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
+        self.fps_label_entry.grid(row=2, column=0, sticky="e", pady=(10, 0))
+        self.fps_entry = ttk.Entry(button_frame, width=6)
+        self.fps_entry.insert(0, str(self.record_fps))
+        self.fps_entry.grid(row=2, column=1, pady=(10, 0))
+        self.fps_apply_button = ttk.Button(button_frame, text="Apply FPS", command=self.apply_fps)
+        self.fps_apply_button.grid(row=2, column=2, columnspan=2, padx=(5, 0), pady=(10, 0))
+
         self.debug_var = tk.BooleanVar()
         self.debug_checkbox = ttk.Checkbutton(button_frame, text="Debug", variable=self.debug_var)
         self.debug_checkbox.grid(row=1, column=7, padx=(10, 0), pady=(10, 0))
@@ -495,7 +505,7 @@ class App:
             self.fps_label.config(text=f"Display FPS: {self.last_display_fps:.1f}")
 
         if self.running:
-            self.root.after(100, self.update_video)
+            self.root.after(self.frame_interval_ms, self.update_video)
 
     def auto_cycle_loop(self):
         if self.auto_cycle:
@@ -509,6 +519,20 @@ class App:
 
     def toggle_auto_cycle(self):
         self.auto_cycle = self.auto_cycle_var.get()
+
+    def apply_fps(self):
+        try:
+            fps = float(self.fps_entry.get())
+        except ValueError:
+            messagebox.showerror("Invalid FPS", "Please enter a valid number for FPS.")
+            return
+        if fps <= 0:
+            messagebox.showerror("Invalid FPS", "FPS must be greater than 0.")
+            return
+        self.record_fps = fps
+        self.frame_interval_ms = int(1000.0 / fps)
+        if any(setup.recording for setup in self.setups):
+            messagebox.showinfo("FPS Updated", "Display FPS updated now. Video FPS will apply on next recording.")
 
     def generate_and_register_exp(self, mouse_id):
         try:
@@ -550,7 +574,7 @@ class App:
 
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
         setup.exp_id = exp_id
-        setup.start_recording(mouse_id, session_duration, exp_id)
+        setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
         setup.send_lock_state(log_fn=self.debug_log)
         self.update_setup_label()
 
