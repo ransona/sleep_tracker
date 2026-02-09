@@ -125,6 +125,8 @@ class CameraSetup:
         self.last_frame_ms = 0.0
         self.last_serial_ms = 0.0
         self.serial_lock = threading.Lock()
+        self.last_write_time = None
+        self.last_write_fps = None
 
     def _log(self, message, level="INFO", suffix=""):
         if self.logger:
@@ -184,6 +186,12 @@ class CameraSetup:
             if self.recording:
                 timestamp = time.time() - self.start_time
                 self.writer.write(frame)
+                now = time.time()
+                if self.last_write_time is not None:
+                    delta = now - self.last_write_time
+                    if delta > 0:
+                        self.last_write_fps = 1.0 / delta
+                self.last_write_time = now
                 if not arduino_data:
                     arduino_data = self.last_arduino_line
                 self.csv_writer.writerow([timestamp, arduino_data])
@@ -386,6 +394,9 @@ class App:
         self.video_panel = ttk.Label(self.root)
         self.video_panel.pack()
 
+        self.fps_label = ttk.Label(self.root, text="FPS: --", font=self.small_font)
+        self.fps_label.pack()
+
         self.setup_label = ttk.Label(self.root, text="", font=large_font)
         self.setup_label.pack()
 
@@ -432,9 +443,17 @@ class App:
         self.debug_checkbox.grid(row=1, column=7, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
+        self.last_display_time = None
+        self.last_display_fps = None
 
     def update_video(self):
         setup = self.setups[self.current_setup]
+        now = time.time()
+        if self.last_display_time is not None:
+            delta = now - self.last_display_time
+            if delta > 0:
+                self.last_display_fps = 1.0 / delta
+        self.last_display_time = now
         frame = setup.read_frame()
         if self.debug_var.get():
             self.debug_log(
@@ -470,6 +489,10 @@ class App:
             foreground=color
         )
         self.update_setup_label()
+        if setup.recording and setup.last_write_fps is not None:
+            self.fps_label.config(text=f"Write FPS: {setup.last_write_fps:.1f}")
+        elif self.last_display_fps is not None:
+            self.fps_label.config(text=f"Display FPS: {self.last_display_fps:.1f}")
 
         if self.running:
             self.root.after(100, self.update_video)
