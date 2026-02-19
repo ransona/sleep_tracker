@@ -15,7 +15,30 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_LOG_PATH = "/data/common/habituation/habituation_watcher.log"
 DEFAULT_SIMULATE = False
 
-from preprocess_scripts import run_step1_batch
+try:
+    from preprocess_scripts import run_step1_batch
+except ModuleNotFoundError:
+    # Support running this script directly when preprocess_scripts is a sibling repo.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_parents = [
+        os.path.abspath(os.path.join(script_dir, "..")),
+        os.environ.get("PREPROCESS_SCRIPTS_PARENT", ""),
+    ]
+    for parent in candidate_parents:
+        if not parent:
+            continue
+        if os.path.isdir(os.path.join(parent, "preprocess_scripts")):
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            break
+
+    try:
+        from preprocess_scripts import run_step1_batch
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Could not import preprocess_scripts. Add its parent directory to "
+            "PYTHONPATH or set PREPROCESS_SCRIPTS_PARENT."
+        ) from exc
 
 
 @dataclass
@@ -142,13 +165,15 @@ def run_loop(cfg: WatcherConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config_path = os.path.join(script_dir, DEFAULT_CONFIG_PATH)
     parser = argparse.ArgumentParser(
         description="Background watcher that enqueues new experiments for preprocessing."
     )
     parser.add_argument(
         "--config",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Path to watcher YAML config file (default: {DEFAULT_CONFIG_PATH}).",
+        default=default_config_path,
+        help=f"Path to watcher YAML config file (default: {default_config_path}).",
     )
     return parser.parse_args()
 
