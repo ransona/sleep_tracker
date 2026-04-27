@@ -94,7 +94,8 @@ class CameraSetup:
         logger=None,
         name=None,
         capture_factory=None,
-        low_fps_callback=None
+        low_fps_callback=None,
+        low_fps_enabled=None
     ):
         self.logger = logger
         self._log("Initializing camera", level="DEBUG", suffix=f" {cam_id}")
@@ -108,6 +109,7 @@ class CameraSetup:
             capture_factory = cv2.VideoCapture
         self.capture_factory = capture_factory
         self.low_fps_callback = low_fps_callback
+        self.low_fps_enabled = low_fps_enabled
         self.cap = self.capture_factory(cam_id)
         self._log(self.describe_capture(), level="DEBUG")
         try:
@@ -249,6 +251,10 @@ class CameraSetup:
         return None
 
     def update_fps_diagnostic(self, read_complete, ret):
+        if self.low_fps_enabled is not None and not self.low_fps_enabled():
+            self.reset_fps_diagnostic()
+            return
+
         if self.last_read_complete_time is None:
             self.last_read_complete_time = read_complete
             return
@@ -402,7 +408,8 @@ class App:
                 logger=self.log,
                 name=setup_name,
                 capture_factory=self.open_capture,
-                low_fps_callback=self.handle_low_fps_alert
+                low_fps_callback=self.handle_low_fps_alert,
+                low_fps_enabled=self.is_debug_enabled
             )
             self.setups.append(setup)
             self.log(f"{section_name} initialized.", level="DEBUG")
@@ -449,6 +456,9 @@ class App:
             self.status_text.insert("end", line)
             self.status_text.see("end")
             self.status_dialog.update()
+
+    def is_debug_enabled(self):
+        return hasattr(self, "debug_var") and bool(self.debug_var.get())
 
     def parse_camera_id(self, value):
         text = str(value).strip()
@@ -680,19 +690,21 @@ class App:
         self.left_button.grid(row=0, column=2)
         self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup)
         self.right_button.grid(row=0, column=3)
+        self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system)
+        self.test_button.grid(row=0, column=4, padx=(10, 0))
 
         self.auto_cycle_var = tk.BooleanVar()
         self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle)
-        self.auto_cycle_button.grid(row=0, column=4)
+        self.auto_cycle_button.grid(row=0, column=5)
 
         self.dwell_label = ttk.Label(button_frame, text="Dwell (s):")
-        self.dwell_label.grid(row=0, column=5)
+        self.dwell_label.grid(row=0, column=6)
         self.dwell_entry = ttk.Entry(button_frame, width=5)
         self.dwell_entry.insert(0, "5")
-        self.dwell_entry.grid(row=0, column=6)
+        self.dwell_entry.grid(row=0, column=7)
 
         self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
-        self.lock_state_button.grid(row=1, column=0, columnspan=7, pady=(10, 0))
+        self.lock_state_button.grid(row=1, column=0, columnspan=8, pady=(10, 0))
 
         self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
         self.fps_label_entry.grid(row=2, column=0, sticky="e", pady=(10, 0))
@@ -704,7 +716,7 @@ class App:
 
         self.debug_var = tk.BooleanVar()
         self.debug_checkbox = ttk.Checkbutton(button_frame, text="Debug", variable=self.debug_var)
-        self.debug_checkbox.grid(row=1, column=7, padx=(10, 0), pady=(10, 0))
+        self.debug_checkbox.grid(row=1, column=8, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
         self.last_display_time = None
@@ -828,13 +840,34 @@ class App:
                 return
 
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
-        setup.exp_id = exp_id
-        setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
-        setup.send_lock_state(log_fn=self.debug_log)
+        self.start_setup_recording(setup, mouse_id, session_duration, exp_id)
         self.update_setup_label()
 
     def stop_recording(self):
         self.setups[self.current_setup].stop_recording()
+
+    def start_setup_recording(self, setup, mouse_id, session_duration, exp_id):
+        setup.exp_id = exp_id
+        setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
+        setup.send_lock_state(log_fn=self.debug_log)
+
+    def start_test_system(self):
+        mouse_id = "TEST"
+        session_duration = 600
+        self.mouse_id_entry.delete(0, tk.END)
+        self.mouse_id_entry.insert(0, mouse_id)
+        self.duration_entry.delete(0, tk.END)
+        self.duration_entry.insert(0, str(session_duration))
+
+        exp_id, _remote_exp_dir = self.generate_and_register_exp(mouse_id)
+        for setup in self.setups:
+            self.ensure_setup_capture(setup)
+            self.start_setup_recording(setup, mouse_id, session_duration, exp_id)
+        self.log(
+            f"Started test-system acquisition on {len(self.setups)} setups for {session_duration} minutes under expID '{exp_id}'.",
+            level="WARNING"
+        )
+        self.update_setup_label()
 
     def prev_setup(self):
         self.save_current_setup_settings()
