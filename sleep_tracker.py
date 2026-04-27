@@ -13,6 +13,10 @@ import winreg
 from datetime import datetime
 from PIL import Image, ImageTk
 
+CAPTURE_BACKEND_NAME = "DSHOW"
+CAPTURE_BACKEND = cv2.CAP_DSHOW
+
+
 def parse_bool(value, default=False):
     """Return a best-effort bool from config text."""
     if value is None:
@@ -100,6 +104,7 @@ class CameraSetup:
         if capture_factory is None:
             capture_factory = cv2.VideoCapture
         self.cap = capture_factory(cam_id)
+        self._log(self.describe_capture(), level="DEBUG")
         try:
             if com_port is not None:
                 self.serial = serial.Serial(com_port, 9600, timeout=0.1, write_timeout=1.0)
@@ -127,6 +132,18 @@ class CameraSetup:
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
+
+    def describe_capture(self):
+        if self.cap is None:
+            return f"{self.name or self.cam_id}: capture not created"
+        opened = self.cap.isOpened()
+        width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        return (
+            f"{self.name or self.cam_id}: backend={CAPTURE_BACKEND_NAME}, "
+            f"opened={opened}, size={int(width)}x{int(height)}, fps={fps:.2f}"
+        )
 
     def _log(self, message, level="INFO", suffix=""):
         if self.logger:
@@ -363,9 +380,29 @@ class App:
             return text
 
     def open_capture(self, cam_id):
-        if isinstance(cam_id, int):
-            return cv2.VideoCapture(cam_id)
-        return cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(cam_id, CAPTURE_BACKEND)
+        if cap.isOpened():
+            self.log(f"Opened camera {cam_id} with backend {CAPTURE_BACKEND_NAME}", level="DEBUG")
+            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+            return cap
+        self.log(
+            f"Failed to open camera {cam_id} with backend {CAPTURE_BACKEND_NAME}; falling back to default backend",
+            level="WARNING"
+        )
+        cap.release()
+        cap = cv2.VideoCapture(cam_id)
+        self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+        return cap
+
+    def describe_capture_properties(self, cap, cam_id):
+        opened = cap.isOpened()
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        return (
+            f"Camera {cam_id}: opened={opened}, size={int(width)}x{int(height)}, "
+            f"fps={fps:.2f}"
+        )
 
     def build_gui(self):
         default_font = tkfont.nametofont("TkDefaultFont")
@@ -650,7 +687,7 @@ class App:
         max_index = min(16, max(4, len(paths)))
         entries = []
         for index in range(max_index):
-            cap = cv2.VideoCapture(index)
+            cap = self.open_capture(index)
             if cap.isOpened():
                 cap.release()
                 path = paths[index] if index < len(paths) else ""
