@@ -134,8 +134,10 @@ class CameraSetup:
         self.latest_status = None
         self.last_arduino_line = ""
         self.last_logged_arduino_line = ""
+        self.latest_frame = None
         self.last_frame_ms = 0.0
         self.last_serial_ms = 0.0
+        self.capture_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
@@ -143,14 +145,18 @@ class CameraSetup:
         self.last_effective_fps = None
         self.low_fps_since = None
         self.low_fps_warning_sent = False
+        self.record_interval_s = 0.1
+        self.recording_thread = None
+        self.recording_stop_event = threading.Event()
 
     def describe_capture(self):
-        if self.cap is None:
-            return f"{self.name or self.cam_id}: capture not created"
-        opened = self.cap.isOpened()
-        width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        with self.capture_lock:
+            if self.cap is None:
+                return f"{self.name or self.cam_id}: capture not created"
+            opened = self.cap.isOpened()
+            width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
         return (
             f"{self.name or self.cam_id}: backend={CAPTURE_BACKEND_NAME}, "
             f"opened={opened}, size={int(width)}x{int(height)}, fps={fps:.2f}"
@@ -163,18 +169,23 @@ class CameraSetup:
         self.low_fps_warning_sent = False
 
     def replace_capture(self, cap, description=None):
-        if self.cap is not None and self.cap is not cap:
-            self.cap.release()
-        self.cap = cap
+        with self.capture_lock:
+            if self.cap is not None and self.cap is not cap:
+                self.cap.release()
+            self.cap = cap
+        self.latest_frame = None
         self.reset_fps_diagnostic()
         if description:
             self._log(f"{self.name or self.cam_id}: {description}", level="INFO")
         self._log(self.describe_capture(), level="DEBUG")
 
     def release_capture(self):
-        if self.cap is not None:
-            self.cap.release()
-        self.cap = None
+        self.stop_background_recording()
+        with self.capture_lock:
+            if self.cap is not None:
+                self.cap.release()
+            self.cap = None
+        self.latest_frame = None
         self.reset_fps_diagnostic()
 
     def _log(self, message, level="INFO", suffix=""):
@@ -190,6 +201,7 @@ class CameraSetup:
         self.mouse_id = mouse_id
         self.session_duration = session_duration
         self.start_time = time.time()
+        self.record_interval_s = 1.0 / max(record_fps, 0.1)
         video_path, csv_path = generate_file_paths(mouse_id, exp_id, self.cam_id, self.root_dir)
         meta_path = os.path.join(os.path.dirname(video_path), f"{exp_id}_meta.txt")
         with open(meta_path, "w", newline="") as meta_file:
@@ -202,13 +214,37 @@ class CameraSetup:
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'arduino_data'])
         self.recording = True
+        self.recording_stop_event.clear()
+        self.recording_thread = threading.Thread(target=self.recording_loop, daemon=True)
+        self.recording_thread.start()
 
     def stop_recording(self):
         self.recording = False
+        self.stop_background_recording()
         if self.writer:
             self.writer.release()
+            self.writer = None
         if self.csv_file:
             self.csv_file.close()
+            self.csv_file = None
+        self.csv_writer = None
+
+    def stop_background_recording(self):
+        self.recording_stop_event.set()
+        if self.recording_thread is not None and self.recording_thread.is_alive() and threading.current_thread() is not self.recording_thread:
+            self.recording_thread.join(timeout=2.0)
+        self.recording_thread = None
+
+    def recording_loop(self):
+        while not self.recording_stop_event.is_set() and self.recording:
+            loop_start = time.time()
+            frame = self.read_frame()
+            if frame is not None:
+                self.latest_frame = frame.copy()
+            elapsed = time.time() - loop_start
+            sleep_s = self.record_interval_s - elapsed
+            if sleep_s > 0:
+                self.recording_stop_event.wait(sleep_s)
 
     def apply_flips(self, frame):
         if self.flip_horizontal:
@@ -219,7 +255,10 @@ class CameraSetup:
 
     def read_frame(self):
         frame_start = time.time()
-        ret, frame = self.cap.read()
+        with self.capture_lock:
+            if self.cap is None:
+                return None
+            ret, frame = self.cap.read()
         read_complete = time.time()
         self.last_frame_ms = (read_complete - frame_start) * 1000.0
         self.update_fps_diagnostic(read_complete, ret)
@@ -249,6 +288,11 @@ class CameraSetup:
                 self.elapsed_time = int(timestamp)
             return frame
         return None
+
+    def get_latest_frame(self):
+        if self.latest_frame is None:
+            return None
+        return self.latest_frame.copy()
 
     def update_fps_diagnostic(self, read_complete, ret):
         if self.low_fps_enabled is not None and not self.low_fps_enabled():
@@ -602,7 +646,11 @@ class App:
         successes = 0
         for _ in range(frame_count):
             frame_start = time.time()
-            ret, _frame = setup.cap.read()
+            with setup.capture_lock:
+                if setup.cap is None:
+                    ret = False
+                else:
+                    ret, _frame = setup.cap.read()
             duration_ms = (time.time() - frame_start) * 1000.0
             durations_ms.append(duration_ms)
             if ret:
@@ -724,14 +772,18 @@ class App:
 
     def update_video(self):
         setup = self.setups[self.current_setup]
-        self.ensure_setup_capture(setup)
+        if not setup.recording:
+            self.ensure_setup_capture(setup)
         now = time.time()
         if self.last_display_time is not None:
             delta = now - self.last_display_time
             if delta > 0:
                 self.last_display_fps = 1.0 / delta
         self.last_display_time = now
-        frame = setup.read_frame()
+        if setup.recording:
+            frame = setup.get_latest_frame()
+        else:
+            frame = setup.read_frame()
         if self.debug_var.get():
             self.debug_log(
                 f"{setup.name}: frame_read={setup.last_frame_ms:.1f}ms, "
