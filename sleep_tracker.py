@@ -110,6 +110,7 @@ class CameraSetup:
         self.capture_factory = capture_factory
         self.low_fps_callback = low_fps_callback
         self.low_fps_enabled = low_fps_enabled
+        self.capture_lock = threading.Lock()
         self.cap = self.capture_factory(cam_id)
         self._log(self.describe_capture(), level="DEBUG")
         try:
@@ -137,7 +138,6 @@ class CameraSetup:
         self.latest_frame = None
         self.last_frame_ms = 0.0
         self.last_serial_ms = 0.0
-        self.capture_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
