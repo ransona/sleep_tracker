@@ -15,6 +15,8 @@ from PIL import Image, ImageTk
 
 CAPTURE_BACKEND_NAME = "DSHOW"
 CAPTURE_BACKEND = cv2.CAP_DSHOW
+LOW_FPS_THRESHOLD = 5.0
+LOW_FPS_DURATION_S = 10.0
 
 
 def parse_bool(value, default=False):
@@ -91,7 +93,8 @@ class CameraSetup:
         flip_vertical=False,
         logger=None,
         name=None,
-        capture_factory=None
+        capture_factory=None,
+        low_fps_callback=None
     ):
         self.logger = logger
         self._log("Initializing camera", level="DEBUG", suffix=f" {cam_id}")
@@ -103,7 +106,9 @@ class CameraSetup:
         self.flip_vertical = flip_vertical
         if capture_factory is None:
             capture_factory = cv2.VideoCapture
-        self.cap = capture_factory(cam_id)
+        self.capture_factory = capture_factory
+        self.low_fps_callback = low_fps_callback
+        self.cap = self.capture_factory(cam_id)
         self._log(self.describe_capture(), level="DEBUG")
         try:
             if com_port is not None:
@@ -132,6 +137,10 @@ class CameraSetup:
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
+        self.last_read_complete_time = None
+        self.last_effective_fps = None
+        self.low_fps_since = None
+        self.low_fps_warning_sent = False
 
     def describe_capture(self):
         if self.cap is None:
@@ -144,6 +153,27 @@ class CameraSetup:
             f"{self.name or self.cam_id}: backend={CAPTURE_BACKEND_NAME}, "
             f"opened={opened}, size={int(width)}x{int(height)}, fps={fps:.2f}"
         )
+
+    def reset_fps_diagnostic(self):
+        self.last_read_complete_time = None
+        self.last_effective_fps = None
+        self.low_fps_since = None
+        self.low_fps_warning_sent = False
+
+    def replace_capture(self, cap, description=None):
+        if self.cap is not None and self.cap is not cap:
+            self.cap.release()
+        self.cap = cap
+        self.reset_fps_diagnostic()
+        if description:
+            self._log(f"{self.name or self.cam_id}: {description}", level="INFO")
+        self._log(self.describe_capture(), level="DEBUG")
+
+    def release_capture(self):
+        if self.cap is not None:
+            self.cap.release()
+        self.cap = None
+        self.reset_fps_diagnostic()
 
     def _log(self, message, level="INFO", suffix=""):
         if self.logger:
@@ -188,7 +218,9 @@ class CameraSetup:
     def read_frame(self):
         frame_start = time.time()
         ret, frame = self.cap.read()
-        self.last_frame_ms = (time.time() - frame_start) * 1000.0
+        read_complete = time.time()
+        self.last_frame_ms = (read_complete - frame_start) * 1000.0
+        self.update_fps_diagnostic(read_complete, ret)
         arduino_data = ""
         serial_start = time.time()
         with self.serial_lock:
@@ -215,6 +247,48 @@ class CameraSetup:
                 self.elapsed_time = int(timestamp)
             return frame
         return None
+
+    def update_fps_diagnostic(self, read_complete, ret):
+        if self.last_read_complete_time is None:
+            self.last_read_complete_time = read_complete
+            return
+
+        delta = read_complete - self.last_read_complete_time
+        self.last_read_complete_time = read_complete
+        if delta <= 0:
+            return
+
+        self.last_effective_fps = 1.0 / delta
+        is_low_fps = (not ret) or (self.last_effective_fps < LOW_FPS_THRESHOLD)
+
+        if is_low_fps:
+            if self.low_fps_since is None:
+                self.low_fps_since = read_complete
+            elif (not self.low_fps_warning_sent) and (read_complete - self.low_fps_since >= LOW_FPS_DURATION_S):
+                fps_text = "n/a" if self.last_effective_fps is None else f"{self.last_effective_fps:.2f}"
+                self._log(
+                    (
+                        f"{self.name or self.cam_id}: low camera framerate detected "
+                        f"({fps_text} Hz < {LOW_FPS_THRESHOLD:.1f} Hz for >{LOW_FPS_DURATION_S:.0f} s, "
+                        f"frame_read={self.last_frame_ms:.1f} ms, frame_ok={ret})"
+                    ),
+                    level="WARNING"
+                )
+                self.low_fps_warning_sent = True
+                if self.low_fps_callback is not None:
+                    self.low_fps_callback(self)
+            return
+
+        if self.low_fps_since is not None and self.low_fps_warning_sent:
+            self._log(
+                (
+                    f"{self.name or self.cam_id}: camera framerate recovered "
+                    f"to {self.last_effective_fps:.2f} Hz"
+                ),
+                level="INFO"
+            )
+        self.low_fps_since = None
+        self.low_fps_warning_sent = False
 
     def parse_arduino_status(self, line):
         parts = [part.strip() for part in line.split(";")]
@@ -269,6 +343,9 @@ class App:
         self.auto_cycle_interval = 5
         self.record_fps = 10.0
         self.frame_interval_ms = int(1000.0 / self.record_fps)
+        self.low_fps_diagnostic_pending = False
+        self.low_fps_diagnostic_setup = None
+        self.low_fps_diagnostic_running = False
 
         self.status_dialog = None
         self.status_text = None
@@ -324,7 +401,8 @@ class App:
                 flip_vertical=flip_vertical,
                 logger=self.log,
                 name=setup_name,
-                capture_factory=self.open_capture
+                capture_factory=self.open_capture,
+                low_fps_callback=self.handle_low_fps_alert
             )
             self.setups.append(setup)
             self.log(f"{section_name} initialized.", level="DEBUG")
@@ -380,10 +458,21 @@ class App:
             return text
 
     def open_capture(self, cam_id):
-        cap = cv2.VideoCapture(cam_id, CAPTURE_BACKEND)
-        if cap.isOpened():
-            self.log(f"Opened camera {cam_id} with backend {CAPTURE_BACKEND_NAME}", level="DEBUG")
+        return self.open_capture_with_fallback(cam_id, log_success=True)
+
+    def open_capture_with_backend(self, cam_id, backend, backend_name, log_success=True):
+        cap = cv2.VideoCapture(cam_id, backend)
+        if log_success:
+            if cap.isOpened():
+                self.log(f"Opened camera {cam_id} with backend {backend_name}", level="DEBUG")
+            else:
+                self.log(f"Failed to open camera {cam_id} with backend {backend_name}", level="WARNING")
             self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+        return cap
+
+    def open_capture_with_fallback(self, cam_id, log_success=True):
+        cap = self.open_capture_with_backend(cam_id, CAPTURE_BACKEND, CAPTURE_BACKEND_NAME, log_success=log_success)
+        if cap.isOpened():
             return cap
         self.log(
             f"Failed to open camera {cam_id} with backend {CAPTURE_BACKEND_NAME}; falling back to default backend",
@@ -391,8 +480,136 @@ class App:
         )
         cap.release()
         cap = cv2.VideoCapture(cam_id)
-        self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+        if log_success:
+            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
         return cap
+
+    def open_capture_default(self, cam_id, log_success=True):
+        cap = cv2.VideoCapture(cam_id)
+        if log_success:
+            self.log(f"Opened camera {cam_id} with default backend", level="DEBUG")
+            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+        return cap
+
+    def ensure_setup_capture(self, setup):
+        if setup.cap is not None and setup.cap.isOpened():
+            return
+        self.log(f"{setup.name}: reopening released camera {setup.cam_id}", level="INFO")
+        setup.replace_capture(self.open_capture(setup.cam_id), description="capture reopened")
+
+    def handle_low_fps_alert(self, setup):
+        if self.low_fps_diagnostic_running or self.low_fps_diagnostic_pending:
+            return
+        self.low_fps_diagnostic_pending = True
+        self.low_fps_diagnostic_setup = setup
+        self.root.after(0, self.run_low_fps_diagnostic)
+
+    def run_low_fps_diagnostic(self):
+        if not self.low_fps_diagnostic_pending or self.low_fps_diagnostic_setup is None:
+            return
+        if self.low_fps_diagnostic_running:
+            return
+
+        setup = self.low_fps_diagnostic_setup
+        self.low_fps_diagnostic_pending = False
+        self.low_fps_diagnostic_running = True
+        self.log(
+            (
+                f"{setup.name}: starting low-FPS diagnostic after sustained drop "
+                f"below {LOW_FPS_THRESHOLD:.1f} Hz"
+            ),
+            level="WARNING"
+        )
+
+        self.auto_cycle = False
+        self.auto_cycle_var.set(False)
+        self.close_camera_viewer()
+        for other_setup in self.setups:
+            if other_setup.recording:
+                self.log(f"{other_setup.name}: stopping recording for low-FPS diagnostic", level="WARNING")
+                other_setup.stop_recording()
+
+        for other_setup in self.setups:
+            if other_setup is setup:
+                continue
+            other_setup.release_capture()
+            self.log(f"{other_setup.name}: released capture to isolate {setup.name}", level="INFO")
+
+        self.current_setup = self.setups.index(setup)
+        self.load_current_setup_settings()
+        self.ensure_setup_capture(setup)
+        self.sequential_camera_diagnostic(setup)
+        self.low_fps_diagnostic_setup = None
+        self.low_fps_diagnostic_running = False
+
+    def sequential_camera_diagnostic(self, setup):
+        self.log(f"{setup.name}: running sequential camera diagnostic", level="WARNING")
+        if setup.last_effective_fps is None:
+            self.log(f"{setup.name}: recent frame_read={setup.last_frame_ms:.1f} ms, effective_fps=n/a", level="INFO")
+        else:
+            self.log(
+                f"{setup.name}: recent frame_read={setup.last_frame_ms:.1f} ms, effective_fps={setup.last_effective_fps:.2f}",
+                level="INFO"
+            )
+
+        result = self.probe_capture_reads(setup, "current handle")
+        if result["recovered"]:
+            self.log(f"{setup.name}: camera recovered without reopen", level="INFO")
+            return
+
+        setup.replace_capture(
+            self.open_capture(setup.cam_id),
+            description=f"reopened with {CAPTURE_BACKEND_NAME}"
+        )
+        result = self.probe_capture_reads(setup, f"reopened with {CAPTURE_BACKEND_NAME}")
+        if result["recovered"]:
+            self.log(f"{setup.name}: camera recovered after {CAPTURE_BACKEND_NAME} reopen", level="INFO")
+            return
+
+        setup.replace_capture(
+            self.open_capture_default(setup.cam_id),
+            description="reopened with default backend"
+        )
+        result = self.probe_capture_reads(setup, "reopened with default backend")
+        if result["recovered"]:
+            self.log(f"{setup.name}: camera recovered after default-backend reopen", level="INFO")
+            return
+
+        self.log(
+            (
+                f"{setup.name}: camera still slow after sequential diagnostic; "
+                "keeping default-backend handle open for manual inspection"
+            ),
+            level="WARNING"
+        )
+
+    def probe_capture_reads(self, setup, label, frame_count=5):
+        if setup.cap is None or not setup.cap.isOpened():
+            self.log(f"{setup.name}: cannot probe {label}; capture is not open", level="WARNING")
+            return {"recovered": False}
+
+        durations_ms = []
+        successes = 0
+        for _ in range(frame_count):
+            frame_start = time.time()
+            ret, _frame = setup.cap.read()
+            duration_ms = (time.time() - frame_start) * 1000.0
+            durations_ms.append(duration_ms)
+            if ret:
+                successes += 1
+
+        avg_ms = sum(durations_ms) / len(durations_ms)
+        avg_fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0
+        recovered = successes == frame_count and avg_fps >= LOW_FPS_THRESHOLD
+        self.log(
+            (
+                f"{setup.name}: probe '{label}' -> ok_frames={successes}/{frame_count}, "
+                f"avg_read={avg_ms:.1f} ms, approx_fps={avg_fps:.2f}"
+            ),
+            level="INFO"
+        )
+        setup.reset_fps_diagnostic()
+        return {"recovered": recovered, "avg_ms": avg_ms, "avg_fps": avg_fps, "successes": successes}
 
     def describe_capture_properties(self, cap, cam_id):
         opened = cap.isOpened()
@@ -495,6 +712,7 @@ class App:
 
     def update_video(self):
         setup = self.setups[self.current_setup]
+        self.ensure_setup_capture(setup)
         now = time.time()
         if self.last_display_time is not None:
             delta = now - self.last_display_time
@@ -786,7 +1004,7 @@ class App:
     def on_closing(self):
         self.running = False
         for setup in self.setups:
-            setup.cap.release()
+            setup.release_capture()
             setup.stop_recording()
         self.root.destroy()
 
