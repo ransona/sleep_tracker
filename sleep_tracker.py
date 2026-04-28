@@ -396,6 +396,8 @@ class App:
         self.low_fps_diagnostic_pending = False
         self.low_fps_diagnostic_setup = None
         self.low_fps_diagnostic_running = False
+        self.active_incident_log_path = None
+        self.incident_log_lock = threading.Lock()
 
         self.status_dialog = None
         self.status_text = None
@@ -496,6 +498,12 @@ class App:
         else:
             line = f"[{level}] {message}"
         print(line)
+        if self.active_incident_log_path is not None:
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            with self.incident_log_lock:
+                if self.active_incident_log_path is not None:
+                    with open(self.active_incident_log_path, "a", encoding="utf-8") as log_file:
+                        log_file.write(f"{timestamp} {line}\n")
         if self.status_text is not None and self.status_dialog is not None:
             self.status_text.insert("end", line)
             self.status_text.see("end")
@@ -503,6 +511,24 @@ class App:
 
     def is_debug_enabled(self):
         return hasattr(self, "debug_var") and bool(self.debug_var.get())
+
+    def start_incident_log(self, setup):
+        debug_dir = os.path.join(self.root_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_name = (setup.name or f"camera_{setup.cam_id}").replace(" ", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.active_incident_log_path = os.path.join(debug_dir, f"{timestamp}_{safe_name}.log")
+        with open(self.active_incident_log_path, "w", encoding="utf-8") as log_file:
+            log_file.write(f"Incident setup: {setup.name or setup.cam_id}\n")
+            log_file.write(f"Camera ID: {setup.cam_id}\n")
+            log_file.write(f"Opened: {datetime.now().isoformat(timespec='seconds')}\n")
+
+    def close_incident_log(self):
+        if self.active_incident_log_path is None:
+            return
+        path = self.active_incident_log_path
+        self.active_incident_log_path = None
+        self.log(f"Incident debug log saved to {path}", level="INFO")
 
     def parse_camera_id(self, value):
         text = str(value).strip()
@@ -567,34 +593,38 @@ class App:
         setup = self.low_fps_diagnostic_setup
         self.low_fps_diagnostic_pending = False
         self.low_fps_diagnostic_running = True
-        self.log(
-            (
-                f"{setup.name}: starting low-FPS diagnostic after sustained drop "
-                f"below {LOW_FPS_THRESHOLD:.1f} Hz"
-            ),
-            level="WARNING"
-        )
+        self.start_incident_log(setup)
+        try:
+            self.log(
+                (
+                    f"{setup.name}: starting low-FPS diagnostic after sustained drop "
+                    f"below {LOW_FPS_THRESHOLD:.1f} Hz"
+                ),
+                level="WARNING"
+            )
 
-        self.auto_cycle = False
-        self.auto_cycle_var.set(False)
-        self.close_camera_viewer()
-        for other_setup in self.setups:
-            if other_setup.recording:
-                self.log(f"{other_setup.name}: stopping recording for low-FPS diagnostic", level="WARNING")
-                other_setup.stop_recording()
+            self.auto_cycle = False
+            self.auto_cycle_var.set(False)
+            self.close_camera_viewer()
+            for other_setup in self.setups:
+                if other_setup.recording:
+                    self.log(f"{other_setup.name}: stopping recording for low-FPS diagnostic", level="WARNING")
+                    other_setup.stop_recording()
 
-        for other_setup in self.setups:
-            if other_setup is setup:
-                continue
-            other_setup.release_capture()
-            self.log(f"{other_setup.name}: released capture to isolate {setup.name}", level="INFO")
+            for other_setup in self.setups:
+                if other_setup is setup:
+                    continue
+                other_setup.release_capture()
+                self.log(f"{other_setup.name}: released capture to isolate {setup.name}", level="INFO")
 
-        self.current_setup = self.setups.index(setup)
-        self.load_current_setup_settings()
-        self.ensure_setup_capture(setup)
-        self.sequential_camera_diagnostic(setup)
-        self.low_fps_diagnostic_setup = None
-        self.low_fps_diagnostic_running = False
+            self.current_setup = self.setups.index(setup)
+            self.load_current_setup_settings()
+            self.ensure_setup_capture(setup)
+            self.sequential_camera_diagnostic(setup)
+        finally:
+            self.low_fps_diagnostic_setup = None
+            self.low_fps_diagnostic_running = False
+            self.close_incident_log()
 
     def sequential_camera_diagnostic(self, setup):
         self.log(f"{setup.name}: running sequential camera diagnostic", level="WARNING")
