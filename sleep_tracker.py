@@ -36,8 +36,9 @@ def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
     safe_mouse_id = mouse_id if mouse_id else "unknown"
     animal_dir = os.path.join(root_dir, safe_mouse_id, exp_id)
     os.makedirs(animal_dir, exist_ok=True)
-    video_path = os.path.join(animal_dir, f"{exp_id}_habit.mp4")
-    csv_path = os.path.join(animal_dir, f"{exp_id}_frame_times.csv")
+    safe_setup = str(setup_index).replace(" ", "_")
+    video_path = os.path.join(animal_dir, f"{exp_id}_{safe_setup}_habit.mp4")
+    csv_path = os.path.join(animal_dir, f"{exp_id}_{safe_setup}_frame_times.csv")
     return video_path, csv_path
 
 
@@ -135,7 +136,9 @@ class CameraSetup:
         self.latest_status = None
         self.last_arduino_line = ""
         self.last_logged_arduino_line = ""
+        self.frame_lock = threading.Lock()
         self.latest_frame = None
+        self.latest_frame_time = None
         self.last_frame_ms = 0.0
         self.last_serial_ms = 0.0
         self.serial_lock = threading.Lock()
@@ -173,7 +176,9 @@ class CameraSetup:
             if self.cap is not None and self.cap is not cap:
                 self.cap.release()
             self.cap = cap
-        self.latest_frame = None
+        with self.frame_lock:
+            self.latest_frame = None
+            self.latest_frame_time = None
         self.reset_fps_diagnostic()
         if description:
             self._log(f"{self.name or self.cam_id}: {description}", level="INFO")
@@ -185,7 +190,9 @@ class CameraSetup:
             if self.cap is not None:
                 self.cap.release()
             self.cap = None
-        self.latest_frame = None
+        with self.frame_lock:
+            self.latest_frame = None
+            self.latest_frame_time = None
         self.reset_fps_diagnostic()
 
     def _log(self, message, level="INFO", suffix=""):
@@ -202,7 +209,8 @@ class CameraSetup:
         self.session_duration = session_duration
         self.start_time = time.time()
         self.record_interval_s = 1.0 / max(record_fps, 0.1)
-        video_path, csv_path = generate_file_paths(mouse_id, exp_id, self.cam_id, self.root_dir)
+        output_id = self.name or f"camera_{self.cam_id}"
+        video_path, csv_path = generate_file_paths(mouse_id, exp_id, output_id, self.root_dir)
         meta_path = os.path.join(os.path.dirname(video_path), f"{exp_id}_meta.txt")
         with open(meta_path, "w", newline="") as meta_file:
             meta_file.write(self.name or "")
@@ -238,9 +246,7 @@ class CameraSetup:
     def recording_loop(self):
         while not self.recording_stop_event.is_set() and self.recording:
             loop_start = time.time()
-            frame = self.read_frame()
-            if frame is not None:
-                self.latest_frame = frame.copy()
+            self.write_latest_frame()
             elapsed = time.time() - loop_start
             sleep_s = self.record_interval_s - elapsed
             if sleep_s > 0:
@@ -253,11 +259,11 @@ class CameraSetup:
             frame = cv2.flip(frame, 0)
         return frame
 
-    def read_frame(self):
+    def poll_capture(self):
         frame_start = time.time()
         with self.capture_lock:
             if self.cap is None:
-                return None
+                return False
             ret, frame = self.cap.read()
         read_complete = time.time()
         self.last_frame_ms = (read_complete - frame_start) * 1000.0
@@ -273,26 +279,43 @@ class CameraSetup:
         self.last_serial_ms = (time.time() - serial_start) * 1000.0
         if ret:
             frame = self.apply_flips(frame)
-            if self.recording:
-                timestamp = time.time() - self.start_time
-                self.writer.write(frame)
-                now = time.time()
-                if self.last_write_time is not None:
-                    delta = now - self.last_write_time
-                    if delta > 0:
-                        self.last_write_fps = 1.0 / delta
-                self.last_write_time = now
-                if not arduino_data:
-                    arduino_data = self.last_arduino_line
-                self.csv_writer.writerow([timestamp, arduino_data])
-                self.elapsed_time = int(timestamp)
-            return frame
-        return None
+            with self.frame_lock:
+                self.latest_frame = frame.copy()
+                self.latest_frame_time = read_complete
+            return True
+        return False
 
     def get_latest_frame(self):
-        if self.latest_frame is None:
-            return None
-        return self.latest_frame.copy()
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+
+    def get_latest_frame_packet(self):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None, None
+            return self.latest_frame.copy(), self.latest_frame_time
+
+    def write_latest_frame(self):
+        if not self.recording or self.writer is None or self.csv_writer is None:
+            return False
+
+        frame, frame_time = self.get_latest_frame_packet()
+        if frame is None:
+            return False
+
+        timestamp = 0.0 if self.start_time is None else max(0.0, frame_time - self.start_time)
+        self.writer.write(frame)
+        now = time.time()
+        if self.last_write_time is not None:
+            delta = now - self.last_write_time
+            if delta > 0:
+                self.last_write_fps = 1.0 / delta
+        self.last_write_time = now
+        self.csv_writer.writerow([timestamp, self.last_arduino_line])
+        self.elapsed_time = int(timestamp)
+        return True
 
     def update_fps_diagnostic(self, read_complete, ret):
         if self.low_fps_enabled is not None and not self.low_fps_enabled():
@@ -393,6 +416,9 @@ class App:
         self.auto_cycle_interval = 5
         self.record_fps = 10.0
         self.frame_interval_ms = int(1000.0 / self.record_fps)
+        self.acquire_sleep_s = 0.001
+        self.acquisition_stop_event = threading.Event()
+        self.acquisition_thread = None
         self.low_fps_diagnostic_pending = False
         self.low_fps_diagnostic_setup = None
         self.low_fps_diagnostic_running = False
@@ -405,6 +431,7 @@ class App:
         self.log("Starting application", level="DEBUG")
         self.load_config()
         self.log("Configuration loaded", level="DEBUG")
+        self.start_acquisition_loop()
         self.build_gui()
         self.log("GUI built", level="DEBUG")
         self.close_status_dialog()
@@ -463,6 +490,29 @@ class App:
         if not self.setups:
             self.log("No valid camera setups found. Exiting.", level="ERROR")
             self.root.quit()
+
+    def start_acquisition_loop(self):
+        self.acquisition_stop_event.clear()
+        self.acquisition_thread = threading.Thread(target=self.acquisition_loop, daemon=True)
+        self.acquisition_thread.start()
+
+    def stop_acquisition_loop(self):
+        self.acquisition_stop_event.set()
+        if self.acquisition_thread is not None and self.acquisition_thread.is_alive():
+            self.acquisition_thread.join(timeout=2.0)
+        self.acquisition_thread = None
+
+    def acquisition_loop(self):
+        while not self.acquisition_stop_event.is_set():
+            did_work = False
+            for setup in self.setups:
+                if self.acquisition_stop_event.is_set():
+                    break
+                self.ensure_setup_capture(setup)
+                if setup.poll_capture():
+                    did_work = True
+            if not did_work:
+                self.acquisition_stop_event.wait(self.acquire_sleep_s)
 
     def create_status_dialog(self):
         self.status_dialog = tk.Toplevel(self.root)
@@ -594,6 +644,7 @@ class App:
         self.low_fps_diagnostic_pending = False
         self.low_fps_diagnostic_running = True
         self.start_incident_log(setup)
+        self.stop_acquisition_loop()
         try:
             self.log(
                 (
@@ -622,6 +673,8 @@ class App:
             self.ensure_setup_capture(setup)
             self.sequential_camera_diagnostic(setup)
         finally:
+            if self.running:
+                self.start_acquisition_loop()
             self.low_fps_diagnostic_setup = None
             self.low_fps_diagnostic_running = False
             self.close_incident_log()
@@ -802,22 +855,19 @@ class App:
 
     def update_video(self):
         setup = self.setups[self.current_setup]
-        if not setup.recording:
-            self.ensure_setup_capture(setup)
         now = time.time()
         if self.last_display_time is not None:
             delta = now - self.last_display_time
             if delta > 0:
                 self.last_display_fps = 1.0 / delta
         self.last_display_time = now
-        if setup.recording:
-            frame = setup.get_latest_frame()
-        else:
-            frame = setup.read_frame()
+        frame = setup.get_latest_frame()
         if self.debug_var.get():
             self.debug_log(
                 f"{setup.name}: frame_read={setup.last_frame_ms:.1f}ms, "
-                f"serial_drain={setup.last_serial_ms:.1f}ms, frame_ok={frame is not None}"
+                f"serial_drain={setup.last_serial_ms:.1f}ms, "
+                f"effective_fps={setup.last_effective_fps if setup.last_effective_fps is not None else float('nan'):.2f}, "
+                f"frame_ok={frame is not None}"
             )
         if frame is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -850,6 +900,8 @@ class App:
         self.update_setup_label()
         if setup.recording and setup.last_write_fps is not None:
             self.fps_label.config(text=f"Write FPS: {setup.last_write_fps:.1f}")
+        elif setup.last_effective_fps is not None:
+            self.fps_label.config(text=f"Acquire FPS: {setup.last_effective_fps:.1f}")
         elif self.last_display_fps is not None:
             self.fps_label.config(text=f"Display FPS: {self.last_display_fps:.1f}")
 
@@ -1035,19 +1087,18 @@ class App:
                 self.camera_viewer.lift()
                 return
 
-        entries = self.enumerate_camera_entries()
         self.camera_viewer = tk.Toplevel(self.root)
-        self.camera_viewer.title("Available Cameras")
+        self.camera_viewer.title("Configured Cameras")
         self.camera_viewer.geometry("1000x700")
         self.camera_viewer.transient(self.root)
 
-        if not entries:
+        if not self.setups:
             ttk.Label(self.camera_viewer, text="No cameras found.").pack(padx=20, pady=20)
             return
 
         self.camera_viewer_items = []
         columns = 2
-        for idx, entry in enumerate(entries):
+        for idx, setup in enumerate(self.setups):
             frame = ttk.Frame(self.camera_viewer)
             row = idx // columns
             col = idx % columns
@@ -1055,20 +1106,11 @@ class App:
             self.camera_viewer.grid_columnconfigure(col, weight=1)
             self.camera_viewer.grid_rowconfigure(row, weight=1)
 
-            label_text = f"Device {entry['id']}"
-            if entry["path"]:
-                label_text += f"\n{entry['path']}"
+            label_text = f"{setup.name or f'Device {setup.cam_id}'}\nCamera ID: {setup.cam_id}"
             ttk.Label(frame, text=label_text, justify="center", wraplength=480).pack()
             panel = ttk.Label(frame)
             panel.pack(fill="both", expand=True)
-
-            cap = self.open_capture(entry["id"])
-            if not cap.isOpened():
-                panel.config(text="Unable to open camera stream.")
-                cap.release()
-                continue
-
-            self.camera_viewer_items.append({"cap": cap, "panel": panel})
+            self.camera_viewer_items.append({"setup": setup, "panel": panel})
 
         self.camera_viewer.protocol("WM_DELETE_WINDOW", self.close_camera_viewer)
         self.update_camera_viewer()
@@ -1079,10 +1121,10 @@ class App:
         if not self.camera_viewer.winfo_exists():
             return
         for item in self.camera_viewer_items:
-            cap = item["cap"]
+            setup = item["setup"]
             panel = item["panel"]
-            ret, frame = cap.read()
-            if ret:
+            frame = setup.get_latest_frame()
+            if frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(rgb)
                 imgtk = ImageTk.PhotoImage(image=img)
@@ -1092,8 +1134,6 @@ class App:
 
     def close_camera_viewer(self):
         if hasattr(self, "camera_viewer_items"):
-            for item in self.camera_viewer_items:
-                item["cap"].release()
             self.camera_viewer_items = []
         if hasattr(self, "camera_viewer") and self.camera_viewer is not None:
             self.camera_viewer.destroy()
@@ -1118,9 +1158,10 @@ class App:
 
     def on_closing(self):
         self.running = False
+        self.stop_acquisition_loop()
         for setup in self.setups:
-            setup.release_capture()
             setup.stop_recording()
+            setup.release_capture()
         self.root.destroy()
 
 if __name__ == '__main__':
