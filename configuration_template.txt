@@ -3,26 +3,50 @@ RootDirectory = C:/Local_Repository
 RemoteRepository = \\ar-lab-nas1\\DataServer\\Remote_Repository
 ExperimentListDirectory = \\ar-lab-nas1\\DataServer\\Remote_Repository\\habituation
 
-[Top Left]
-CameraID = 0
-DeviceSerial =
-COMPort = COM10
-FlipHorizontal = False
+[Setup 1]
+CameraID = 4
+DeviceSerial = 04520789
+COMPort = COM3
+FlipHorizontal = True
 FlipVertical = False
-UserSet =
-AutoExposure =
-Exposure =
-Gain =
+UserSet = UserSet1
+AutoExposure = -1
+Exposure = 20000
+Gain = 1.8814374728998826
 Contrast =
 
-[Top Right]
+[Setup 2]
 CameraID = 1
-DeviceSerial =
-COMPort = COM11
-FlipHorizontal = False
+DeviceSerial = 05521390
+COMPort = COM4
+FlipHorizontal = True
 FlipVertical = False
-UserSet =
-AutoExposure =
-Exposure =
-Gain =
+UserSet = UserSet1
+AutoExposure = -1
+Exposure = 20000
+Gain = 1.8814374728998826
 Contrast =
+
+[Setup 3]
+CameraID = 3
+DeviceSerial = 04520788
+COMPort = COM5
+FlipHorizontal = True
+FlipVertical = False
+UserSet = UserSet1
+AutoExposure = -1
+Exposure = 20000
+Gain = 1.8814374728998826
+Contrast =
+
+[Setup 4]
+CameraID = 2
+DeviceSerial = 04520790
+COMPort = COM6
+FlipHorizontal = True
+FlipVertical = False
+UserSet = UserSet1
+AutoExposure = -1
+Exposure = 20000
+Gain = 1.8814374728998826
+Contrast = -3
