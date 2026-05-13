@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import font as tkfont
 from tkinter import messagebox
+from tkinter import simpledialog
 import cv2
 import threading
 import time
@@ -12,13 +13,10 @@ import configparser
 import winreg
 from datetime import datetime
 from PIL import Image, ImageTk
+import imagingcontrol4 as ic4
 
 CAPTURE_BACKEND_NAME = "DSHOW"
 CAPTURE_BACKEND = cv2.CAP_DSHOW
-LOW_FPS_THRESHOLD = 5.0
-LOW_FPS_DURATION_S = 10.0
-
-
 def parse_bool(value, default=False):
     """Return a best-effort bool from config text."""
     if value is None:
@@ -29,6 +27,24 @@ def parse_bool(value, default=False):
     if val in ("0", "false", "no", "n", "off"):
         return False
     return default
+
+
+def parse_optional_float(value):
+    """Return float(value) unless the config entry is blank/missing."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def parse_optional_text(value):
+    """Return stripped text unless the config entry is blank/missing."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
@@ -84,6 +100,219 @@ class SimulatedArduino:
     def write(self, _data):
         return 0
 
+
+class ImagingSourceQueueListener(ic4.QueueSinkListener):
+    def __init__(self, buffer_count=6):
+        super().__init__()
+        self.buffer_count = buffer_count
+
+    def sink_connected(self, sink, _image_type, min_buffers_required):
+        sink.alloc_and_queue_buffers(max(self.buffer_count, min_buffers_required))
+        return True
+
+    def frames_queued(self, _sink):
+        return
+
+
+class ImagingSourceCapture:
+    def __init__(self, device_info, capture_settings=None, logger=None):
+        self.device_info = device_info
+        self.capture_settings = capture_settings or {}
+        self.logger = logger
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._worker_thread = None
+        self._latest_frame = None
+        self._latest_frame_id = 0
+        self._last_delivered_frame_id = 0
+        self.grabber = ic4.Grabber()
+        self.grabber.device_open(device_info)
+        self._opened = True
+        self._configure_device()
+        self.listener = ImagingSourceQueueListener(buffer_count=6)
+        self.sink = ic4.QueueSink(
+            self.listener,
+            accepted_pixel_formats=[ic4.PixelFormat.Mono8],
+            max_output_buffers=1,
+        )
+        self.grabber.stream_setup(self.sink, setup_option=ic4.StreamSetupOption.ACQUISITION_START)
+        self._worker_thread = threading.Thread(target=self._drain_queue_loop, daemon=True)
+        self._worker_thread.start()
+
+    def _log(self, message, level="DEBUG"):
+        if self.logger is None:
+            return
+        self.logger(message, level=level)
+
+    def _convert_buffer_to_frame(self, image):
+        array = image.numpy_copy()
+        if array.ndim == 3 and array.shape[2] == 1:
+            array = array[:, :, 0]
+        if array.ndim == 2:
+            return cv2.cvtColor(array, cv2.COLOR_GRAY2BGR)
+        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+
+    def _drain_queue_loop(self):
+        while not self._stop_event.is_set():
+            if not self.isOpened():
+                self._stop_event.wait(0.01)
+                continue
+
+            image = self.sink.try_pop_output_buffer()
+            if image is None:
+                self._stop_event.wait(0.001)
+                continue
+
+            try:
+                frame = self._convert_buffer_to_frame(image)
+            finally:
+                image.release()
+
+            with self._frame_lock:
+                self._latest_frame = frame
+                self._latest_frame_id += 1
+
+    def _configure_device(self):
+        prop_map = self.grabber.device_property_map
+        user_set = self.capture_settings.get("UserSet")
+        if user_set:
+            try:
+                prop_map.set_value(ic4.PropId.USER_SET_SELECTOR, str(user_set))
+                prop_map.execute_command(ic4.PropId.USER_SET_LOAD)
+                self._log(
+                    f"Loaded UserSet '{user_set}' for camera {self.device_info.serial}",
+                    level="DEBUG"
+                )
+            except Exception as exc:
+                self._log(
+                    f"Failed to load UserSet '{user_set}' on {self.device_info.serial}: {exc}",
+                    level="WARNING"
+                )
+        try:
+            prop_map.set_value(ic4.PropId.PIXEL_FORMAT, ic4.PixelFormat.Mono8)
+        except Exception as exc:
+            self._log(f"Failed to set Mono8 pixel format on {self.device_info.serial}: {exc}", level="WARNING")
+
+        auto_exposure = self.capture_settings.get("AutoExposure")
+        if auto_exposure is not None:
+            self.set(cv2.CAP_PROP_AUTO_EXPOSURE, auto_exposure)
+        exposure = self.capture_settings.get("Exposure")
+        if exposure is not None and exposure >= 0:
+            self.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        gain = self.capture_settings.get("Gain")
+        if gain is not None:
+            self.set(cv2.CAP_PROP_GAIN, gain)
+        contrast = self.capture_settings.get("Contrast")
+        if contrast is not None:
+            self._log("Contrast requested but is not mapped in imagingcontrol4 backend; ignoring", level="WARNING")
+
+    def isOpened(self):
+        return self._opened and self.grabber is not None and self.grabber.is_device_open
+
+    def read(self):
+        if not self.isOpened():
+            return False, None
+        with self._frame_lock:
+            if self._latest_frame is None or self._latest_frame_id == self._last_delivered_frame_id:
+                return False, None
+            frame = self._latest_frame.copy()
+            self._last_delivered_frame_id = self._latest_frame_id
+        return True, frame
+
+    def get(self, prop_id):
+        if not self.isOpened():
+            return 0.0
+        prop_map = self.grabber.device_property_map
+        try:
+            if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+                return float(prop_map.get_value_int(ic4.PropId.WIDTH))
+            if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+                return float(prop_map.get_value_int(ic4.PropId.HEIGHT))
+            if prop_id == cv2.CAP_PROP_FPS:
+                return float(prop_map.get_value_float(ic4.PropId.ACQUISITION_FRAME_RATE))
+            if prop_id == cv2.CAP_PROP_AUTO_EXPOSURE:
+                return 1.0 if prop_map.get_value_bool(ic4.PropId.EXPOSURE_AUTO) else -1.0
+            if prop_id == cv2.CAP_PROP_EXPOSURE:
+                return float(prop_map.get_value_float(ic4.PropId.EXPOSURE_TIME))
+            if prop_id == cv2.CAP_PROP_GAIN:
+                return float(prop_map.get_value_float(ic4.PropId.GAIN))
+            if prop_id == cv2.CAP_PROP_CONTRAST:
+                return 0.0
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def get_limits(self, prop_id):
+        if not self.isOpened():
+            return None, None
+        prop_map = self.grabber.device_property_map
+        try:
+            if prop_id == cv2.CAP_PROP_EXPOSURE:
+                current = prop_map.get_value_float(ic4.PropId.EXPOSURE_TIME)
+                prop_map.try_set_value_minimum(ic4.PropId.EXPOSURE_TIME)
+                minimum = prop_map.get_value_float(ic4.PropId.EXPOSURE_TIME)
+                prop_map.try_set_value_maximum(ic4.PropId.EXPOSURE_TIME)
+                maximum = prop_map.get_value_float(ic4.PropId.EXPOSURE_TIME)
+                prop_map.set_value(ic4.PropId.EXPOSURE_TIME, current)
+                return float(minimum), float(maximum)
+            if prop_id == cv2.CAP_PROP_GAIN:
+                current = prop_map.get_value_float(ic4.PropId.GAIN)
+                prop_map.try_set_value_minimum(ic4.PropId.GAIN)
+                minimum = prop_map.get_value_float(ic4.PropId.GAIN)
+                prop_map.try_set_value_maximum(ic4.PropId.GAIN)
+                maximum = prop_map.get_value_float(ic4.PropId.GAIN)
+                prop_map.set_value(ic4.PropId.GAIN, current)
+                return float(minimum), float(maximum)
+        except Exception:
+            return None, None
+        return None, None
+
+    def set(self, prop_id, value):
+        if not self.isOpened():
+            return False
+        prop_map = self.grabber.device_property_map
+        try:
+            if prop_id == cv2.CAP_PROP_AUTO_EXPOSURE:
+                prop_map.set_value(ic4.PropId.EXPOSURE_AUTO, bool(value not in (0, 0.0, -1, -1.0, False)))
+                return True
+            if prop_id == cv2.CAP_PROP_EXPOSURE:
+                prop_map.set_value(ic4.PropId.EXPOSURE_AUTO, False)
+                prop_map.set_value(ic4.PropId.EXPOSURE_TIME, float(value))
+                return True
+            if prop_id == cv2.CAP_PROP_GAIN:
+                try:
+                    prop_map.set_value(ic4.PropId.GAIN_AUTO, False)
+                except Exception:
+                    pass
+                prop_map.set_value(ic4.PropId.GAIN, float(value))
+                return True
+            if prop_id == cv2.CAP_PROP_CONTRAST:
+                return False
+        except Exception as exc:
+            self._log(f"Failed to set property {prop_id} to {value} on {self.device_info.serial}: {exc}", level="WARNING")
+            return False
+        return False
+
+    def release(self):
+        if self.grabber is None:
+            self._opened = False
+            return
+        self._stop_event.set()
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2.0)
+        try:
+            if self.grabber.is_streaming:
+                self.grabber.stream_stop()
+        except Exception:
+            pass
+        self.listener = None
+        self.sink = None
+        self.grabber = None
+        self.device_info = None
+        with self._frame_lock:
+            self._latest_frame = None
+        self._opened = False
+
 class CameraSetup:
     def __init__(
         self,
@@ -94,23 +323,23 @@ class CameraSetup:
         flip_vertical=False,
         logger=None,
         name=None,
+        config_section=None,
+        capture_settings=None,
         capture_factory=None,
-        low_fps_callback=None,
-        low_fps_enabled=None
     ):
         self.logger = logger
         self._log("Initializing camera", level="DEBUG", suffix=f" {cam_id}")
         self.name = name
+        self.config_section = config_section or name or str(cam_id)
         self.cam_id = cam_id
         self.com_port = com_port
         self.root_dir = root_dir
         self.flip_horizontal = flip_horizontal
         self.flip_vertical = flip_vertical
+        self.capture_settings = capture_settings or {}
         if capture_factory is None:
             capture_factory = cv2.VideoCapture
         self.capture_factory = capture_factory
-        self.low_fps_callback = low_fps_callback
-        self.low_fps_enabled = low_fps_enabled
         self.capture_lock = threading.Lock()
         self.cap = self.capture_factory(cam_id)
         self._log(self.describe_capture(), level="DEBUG")
@@ -146,11 +375,10 @@ class CameraSetup:
         self.last_write_fps = None
         self.last_read_complete_time = None
         self.last_effective_fps = None
-        self.low_fps_since = None
-        self.low_fps_warning_sent = False
         self.record_interval_s = 0.1
         self.recording_thread = None
         self.recording_stop_event = threading.Event()
+        self.property_limits = {}
 
     def describe_capture(self):
         with self.capture_lock:
@@ -168,8 +396,6 @@ class CameraSetup:
     def reset_fps_diagnostic(self):
         self.last_read_complete_time = None
         self.last_effective_fps = None
-        self.low_fps_since = None
-        self.low_fps_warning_sent = False
 
     def replace_capture(self, cap, description=None):
         with self.capture_lock:
@@ -259,6 +485,9 @@ class CameraSetup:
             frame = cv2.flip(frame, 0)
         return frame
 
+    def annotate_frame(self, frame, read_complete):
+        return frame
+
     def poll_capture(self):
         frame_start = time.time()
         with self.capture_lock:
@@ -279,6 +508,7 @@ class CameraSetup:
         self.last_serial_ms = (time.time() - serial_start) * 1000.0
         if ret:
             frame = self.apply_flips(frame)
+            frame = self.annotate_frame(frame, read_complete)
             with self.frame_lock:
                 self.latest_frame = frame.copy()
                 self.latest_frame_time = read_complete
@@ -318,6 +548,9 @@ class CameraSetup:
         return True
 
     def update_fps_diagnostic(self, read_complete, ret):
+        if not ret:
+            return
+
         if self.last_read_complete_time is None:
             self.last_read_complete_time = read_complete
             return
@@ -328,42 +561,6 @@ class CameraSetup:
             return
 
         self.last_effective_fps = 1.0 / delta
-        diagnostics_enabled = self.low_fps_enabled is None or self.low_fps_enabled()
-        if not diagnostics_enabled:
-            self.low_fps_since = None
-            self.low_fps_warning_sent = False
-            return
-
-        is_low_fps = (not ret) or (self.last_effective_fps < LOW_FPS_THRESHOLD)
-
-        if is_low_fps:
-            if self.low_fps_since is None:
-                self.low_fps_since = read_complete
-            elif (not self.low_fps_warning_sent) and (read_complete - self.low_fps_since >= LOW_FPS_DURATION_S):
-                fps_text = "n/a" if self.last_effective_fps is None else f"{self.last_effective_fps:.2f}"
-                self._log(
-                    (
-                        f"{self.name or self.cam_id}: low camera framerate detected "
-                        f"({fps_text} Hz < {LOW_FPS_THRESHOLD:.1f} Hz for >{LOW_FPS_DURATION_S:.0f} s, "
-                        f"frame_read={self.last_frame_ms:.1f} ms, frame_ok={ret})"
-                    ),
-                    level="WARNING"
-                )
-                self.low_fps_warning_sent = True
-                if self.low_fps_callback is not None:
-                    self.low_fps_callback(self)
-            return
-
-        if self.low_fps_since is not None and self.low_fps_warning_sent:
-            self._log(
-                (
-                    f"{self.name or self.cam_id}: camera framerate recovered "
-                    f"to {self.last_effective_fps:.2f} Hz"
-                ),
-                level="INFO"
-            )
-        self.low_fps_since = None
-        self.low_fps_warning_sent = False
 
     def parse_arduino_status(self, line):
         parts = [part.strip() for part in line.split(";")]
@@ -421,18 +618,18 @@ class App:
         self.acquire_sleep_s = 0.001
         self.acquisition_stop_event = threading.Event()
         self.acquisition_thread = None
-        self.low_fps_diagnostic_pending = False
-        self.low_fps_diagnostic_setup = None
-        self.low_fps_diagnostic_running = False
-        self.active_incident_log_path = None
-        self.incident_log_lock = threading.Lock()
 
         self.status_dialog = None
         self.status_text = None
         self.create_status_dialog()
         self.log("Starting application", level="DEBUG")
+        self.initialization_failed = False
+        self.initialize_imaging_source()
         self.load_config()
         self.log("Configuration loaded", level="DEBUG")
+        if self.initialization_failed:
+            self.close_status_dialog()
+            return
         self.start_acquisition_loop()
         self.build_gui()
         self.log("GUI built", level="DEBUG")
@@ -442,8 +639,9 @@ class App:
 
     def load_config(self):
         self.log("Reading configuration file...", level="DEBUG")
+        self.config_path = 'configuration.txt'
         config = configparser.ConfigParser()
-        config.read('configuration.txt')
+        config.read(self.config_path)
         self.log("Configuration file loaded.", level="DEBUG")
         self.root_dir = config['DEFAULT']['RootDirectory']
         self.remote_repo = config['DEFAULT'].get('RemoteRepository', r'\\ar-lab-nas1\\DataServer\\Remote_Repository')
@@ -454,16 +652,31 @@ class App:
             os.makedirs(self.root_dir)
 
         section_names = config.sections()
+        configured_camera_ids = []
+        for section_name in section_names:
+            if "CameraID" not in config[section_name]:
+                continue
+            try:
+                configured_camera_ids.append(self.parse_camera_id(config[section_name]["CameraID"]))
+            except Exception:
+                pass
+        self.camera_id_mode = self.determine_camera_id_mode(configured_camera_ids)
+
         for section_name in section_names:
             if section_name.upper() == "DEFAULT":
                 continue
             if "CameraID" not in config[section_name]:
                 continue
-            cam_id = self.parse_camera_id(config[section_name]["CameraID"])
+            raw_device_serial = config[section_name].get("DeviceSerial", "").strip()
+            if raw_device_serial:
+                cam_id = raw_device_serial
+            else:
+                cam_id = self.parse_camera_id(config[section_name]["CameraID"])
             com_port = config[section_name]["COMPort"]
+            capture_settings = self.parse_capture_settings(config[section_name], section_name)
             self.log(f"{section_name}: Checking camera {cam_id} and COM port {com_port}", level="DEBUG")
 
-            cap = self.open_capture(cam_id)
+            cap = self.open_capture(cam_id, capture_settings=capture_settings)
             if not cap.isOpened():
                 self.log(f"{section_name}: Camera ID {cam_id} could not be opened. Skipping this setup.", level="ERROR")
                 cap.release()
@@ -482,16 +695,75 @@ class App:
                 flip_vertical=flip_vertical,
                 logger=self.log,
                 name=setup_name,
-                capture_factory=self.open_capture,
-                low_fps_callback=self.handle_low_fps_alert,
-                low_fps_enabled=self.is_debug_enabled
+                config_section=section_name,
+                capture_settings=capture_settings,
+                capture_factory=lambda camera_id, settings=capture_settings: self.open_capture(
+                    camera_id,
+                    capture_settings=settings
+                )
             )
             self.setups.append(setup)
             self.log(f"{section_name} initialized.", level="DEBUG")
 
         if not self.setups:
             self.log("No valid camera setups found. Exiting.", level="ERROR")
+            self.initialization_failed = True
             self.root.quit()
+
+    def parse_capture_settings(self, section, section_name):
+        settings = {}
+        settings["UserSet"] = parse_optional_text(section.get("UserSet"))
+        for option in ("AutoExposure", "Exposure", "Gain", "Contrast"):
+            try:
+                settings[option] = parse_optional_float(section.get(option))
+            except ValueError:
+                self.log(
+                    f"{section_name}: invalid {option} value '{section.get(option)}'; ignoring",
+                    level="WARNING"
+                )
+                settings[option] = None
+        return settings
+
+    def initialize_imaging_source(self):
+        ic4.Library.init()
+        self.ic4_device_infos = list(ic4.DeviceEnum.devices())
+        self.log(
+            f"Imaging Source devices: {[(device.model_name, device.serial) for device in self.ic4_device_infos]}",
+            level="DEBUG"
+        )
+
+    def determine_camera_id_mode(self, configured_camera_ids):
+        numeric_ids = [cam_id for cam_id in configured_camera_ids if isinstance(cam_id, int)]
+        if not numeric_ids:
+            return "serial"
+        if (
+            self.ic4_device_infos
+            and min(numeric_ids) >= 1
+            and max(numeric_ids) <= len(self.ic4_device_infos)
+            and 0 not in numeric_ids
+        ):
+            return "one_based_index"
+        return "zero_based_index"
+
+    def resolve_imaging_source_device(self, cam_id):
+        if isinstance(cam_id, int):
+            if self.camera_id_mode == "one_based_index":
+                index = cam_id - 1
+            else:
+                index = cam_id
+            if index < 0 or index >= len(self.ic4_device_infos):
+                raise IndexError(f"CameraID {cam_id} did not resolve to an Imaging Source device")
+            return self.ic4_device_infos[index]
+
+        text = str(cam_id).strip()
+        for device in self.ic4_device_infos:
+            if device.serial == text:
+                return device
+        for device in self.ic4_device_infos:
+            label = f"{device.model_name} {device.serial}".strip()
+            if label == text or device.model_name == text:
+                return device
+        raise LookupError(f"Could not resolve Imaging Source device '{cam_id}'")
 
     def start_acquisition_loop(self):
         self.acquisition_stop_event.clear()
@@ -550,37 +822,10 @@ class App:
         else:
             line = f"[{level}] {message}"
         print(line)
-        if self.active_incident_log_path is not None:
-            timestamp = datetime.now().isoformat(timespec="seconds")
-            with self.incident_log_lock:
-                if self.active_incident_log_path is not None:
-                    with open(self.active_incident_log_path, "a", encoding="utf-8") as log_file:
-                        log_file.write(f"{timestamp} {line}\n")
         if self.status_text is not None and self.status_dialog is not None:
             self.status_text.insert("end", line)
             self.status_text.see("end")
             self.status_dialog.update()
-
-    def is_debug_enabled(self):
-        return hasattr(self, "debug_var") and bool(self.debug_var.get())
-
-    def start_incident_log(self, setup):
-        debug_dir = os.path.join(self.root_dir, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        safe_name = (setup.name or f"camera_{setup.cam_id}").replace(" ", "_")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.active_incident_log_path = os.path.join(debug_dir, f"{timestamp}_{safe_name}.log")
-        with open(self.active_incident_log_path, "w", encoding="utf-8") as log_file:
-            log_file.write(f"Incident setup: {setup.name or setup.cam_id}\n")
-            log_file.write(f"Camera ID: {setup.cam_id}\n")
-            log_file.write(f"Opened: {datetime.now().isoformat(timespec='seconds')}\n")
-
-    def close_incident_log(self):
-        if self.active_incident_log_path is None:
-            return
-        path = self.active_incident_log_path
-        self.active_incident_log_path = None
-        self.log(f"Incident debug log saved to {path}", level="INFO")
 
     def parse_camera_id(self, value):
         text = str(value).strip()
@@ -589,179 +834,61 @@ class App:
         except ValueError:
             return text
 
-    def open_capture(self, cam_id):
-        return self.open_capture_with_fallback(cam_id, log_success=True)
+    def open_capture(self, cam_id, capture_settings=None):
+        return self.open_capture_with_fallback(cam_id, capture_settings=capture_settings, log_success=True)
 
-    def open_capture_with_backend(self, cam_id, backend, backend_name, log_success=True):
-        cap = cv2.VideoCapture(cam_id, backend)
+    def open_capture_with_fallback(self, cam_id, capture_settings=None, log_success=True):
+        try:
+            device_info = self.resolve_imaging_source_device(cam_id)
+            cap = ImagingSourceCapture(device_info, capture_settings=capture_settings, logger=self.log)
+        except Exception as exc:
+            self.log(f"Failed to open Imaging Source camera {cam_id}: {exc}", level="WARNING")
+            class _ClosedCapture:
+                def isOpened(self):
+                    return False
+                def get(self, _prop_id):
+                    return 0.0
+                def set(self, _prop_id, _value):
+                    return False
+                def read(self):
+                    return False, None
+                def release(self):
+                    return None
+            cap = _ClosedCapture()
         if log_success:
             if cap.isOpened():
-                self.log(f"Opened camera {cam_id} with backend {backend_name}", level="DEBUG")
+                serial = getattr(getattr(cap, "device_info", None), "serial", "unknown")
+                self.log(f"Opened camera {cam_id} with Imaging Source backend (serial={serial})", level="DEBUG")
+                self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
             else:
-                self.log(f"Failed to open camera {cam_id} with backend {backend_name}", level="WARNING")
-            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
+                self.log(f"Failed to open camera {cam_id} with Imaging Source backend", level="WARNING")
         return cap
 
-    def open_capture_with_fallback(self, cam_id, log_success=True):
-        cap = self.open_capture_with_backend(cam_id, CAPTURE_BACKEND, CAPTURE_BACKEND_NAME, log_success=log_success)
-        if cap.isOpened():
-            return cap
-        self.log(
-            f"Failed to open camera {cam_id} with backend {CAPTURE_BACKEND_NAME}; falling back to default backend",
-            level="WARNING"
-        )
-        cap.release()
-        cap = cv2.VideoCapture(cam_id)
-        if log_success:
-            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
-        return cap
-
-    def open_capture_default(self, cam_id, log_success=True):
-        cap = cv2.VideoCapture(cam_id)
-        if log_success:
-            self.log(f"Opened camera {cam_id} with default backend", level="DEBUG")
-            self.log(self.describe_capture_properties(cap, cam_id), level="DEBUG")
-        return cap
+    def open_capture_default(self, cam_id, capture_settings=None, log_success=True):
+        return self.open_capture_with_fallback(cam_id, capture_settings=capture_settings, log_success=log_success)
 
     def ensure_setup_capture(self, setup):
         if setup.cap is not None and setup.cap.isOpened():
             return
         self.log(f"{setup.name}: reopening released camera {setup.cam_id}", level="INFO")
-        setup.replace_capture(self.open_capture(setup.cam_id), description="capture reopened")
-
-    def handle_low_fps_alert(self, setup):
-        if self.low_fps_diagnostic_running or self.low_fps_diagnostic_pending:
-            return
-        self.low_fps_diagnostic_pending = True
-        self.low_fps_diagnostic_setup = setup
-        self.root.after(0, self.run_low_fps_diagnostic)
-
-    def run_low_fps_diagnostic(self):
-        if not self.low_fps_diagnostic_pending or self.low_fps_diagnostic_setup is None:
-            return
-        if self.low_fps_diagnostic_running:
-            return
-
-        setup = self.low_fps_diagnostic_setup
-        self.low_fps_diagnostic_pending = False
-        self.low_fps_diagnostic_running = True
-        self.start_incident_log(setup)
-        self.stop_acquisition_loop()
-        try:
-            self.log(
-                (
-                    f"{setup.name}: starting low-FPS diagnostic after sustained drop "
-                    f"below {LOW_FPS_THRESHOLD:.1f} Hz"
-                ),
-                level="WARNING"
-            )
-
-            self.auto_cycle = False
-            self.auto_cycle_var.set(False)
-            self.close_camera_viewer()
-            for other_setup in self.setups:
-                if other_setup.recording:
-                    self.log(f"{other_setup.name}: stopping recording for low-FPS diagnostic", level="WARNING")
-                    other_setup.stop_recording()
-
-            for other_setup in self.setups:
-                if other_setup is setup:
-                    continue
-                other_setup.release_capture()
-                self.log(f"{other_setup.name}: released capture to isolate {setup.name}", level="INFO")
-
-            self.current_setup = self.setups.index(setup)
-            self.load_current_setup_settings()
-            self.ensure_setup_capture(setup)
-            self.sequential_camera_diagnostic(setup)
-        finally:
-            if self.running:
-                self.start_acquisition_loop()
-            self.low_fps_diagnostic_setup = None
-            self.low_fps_diagnostic_running = False
-            self.close_incident_log()
-
-    def sequential_camera_diagnostic(self, setup):
-        self.log(f"{setup.name}: running sequential camera diagnostic", level="WARNING")
-        if setup.last_effective_fps is None:
-            self.log(f"{setup.name}: recent frame_read={setup.last_frame_ms:.1f} ms, effective_fps=n/a", level="INFO")
-        else:
-            self.log(
-                f"{setup.name}: recent frame_read={setup.last_frame_ms:.1f} ms, effective_fps={setup.last_effective_fps:.2f}",
-                level="INFO"
-            )
-
-        result = self.probe_capture_reads(setup, "current handle")
-        if result["recovered"]:
-            self.log(f"{setup.name}: camera recovered without reopen", level="INFO")
-            return
-
         setup.replace_capture(
-            self.open_capture(setup.cam_id),
-            description=f"reopened with {CAPTURE_BACKEND_NAME}"
+            self.open_capture(setup.cam_id, capture_settings=setup.capture_settings),
+            description="capture reopened"
         )
-        result = self.probe_capture_reads(setup, f"reopened with {CAPTURE_BACKEND_NAME}")
-        if result["recovered"]:
-            self.log(f"{setup.name}: camera recovered after {CAPTURE_BACKEND_NAME} reopen", level="INFO")
-            return
-
-        setup.replace_capture(
-            self.open_capture_default(setup.cam_id),
-            description="reopened with default backend"
-        )
-        result = self.probe_capture_reads(setup, "reopened with default backend")
-        if result["recovered"]:
-            self.log(f"{setup.name}: camera recovered after default-backend reopen", level="INFO")
-            return
-
-        self.log(
-            (
-                f"{setup.name}: camera still slow after sequential diagnostic; "
-                "keeping default-backend handle open for manual inspection"
-            ),
-            level="WARNING"
-        )
-
-    def probe_capture_reads(self, setup, label, frame_count=5):
-        if setup.cap is None or not setup.cap.isOpened():
-            self.log(f"{setup.name}: cannot probe {label}; capture is not open", level="WARNING")
-            return {"recovered": False}
-
-        durations_ms = []
-        successes = 0
-        for _ in range(frame_count):
-            frame_start = time.time()
-            with setup.capture_lock:
-                if setup.cap is None:
-                    ret = False
-                else:
-                    ret, _frame = setup.cap.read()
-            duration_ms = (time.time() - frame_start) * 1000.0
-            durations_ms.append(duration_ms)
-            if ret:
-                successes += 1
-
-        avg_ms = sum(durations_ms) / len(durations_ms)
-        avg_fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0
-        recovered = successes == frame_count and avg_fps >= LOW_FPS_THRESHOLD
-        self.log(
-            (
-                f"{setup.name}: probe '{label}' -> ok_frames={successes}/{frame_count}, "
-                f"avg_read={avg_ms:.1f} ms, approx_fps={avg_fps:.2f}"
-            ),
-            level="INFO"
-        )
-        setup.reset_fps_diagnostic()
-        return {"recovered": recovered, "avg_ms": avg_ms, "avg_fps": avg_fps, "successes": successes}
 
     def describe_capture_properties(self, cap, cam_id):
         opened = cap.isOpened()
         width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         fps = cap.get(cv2.CAP_PROP_FPS)
+        auto_exposure = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
+        gain = cap.get(cv2.CAP_PROP_GAIN)
+        contrast = cap.get(cv2.CAP_PROP_CONTRAST)
         return (
             f"Camera {cam_id}: opened={opened}, size={int(width)}x{int(height)}, "
-            f"fps={fps:.2f}"
+            f"fps={fps:.2f}, auto_exposure={auto_exposure:.4f}, exposure={exposure:.4f}, "
+            f"gain={gain:.4f}, contrast={contrast:.4f}"
         )
 
     def build_gui(self):
@@ -790,8 +917,37 @@ class App:
         self.duration_entry = ttk.Entry(self.root, justify="center")
         self.duration_entry.pack()
 
-        self.video_panel = ttk.Label(self.root)
-        self.video_panel.pack()
+        media_frame = ttk.Frame(self.root)
+        media_frame.pack(padx=10, pady=10)
+
+        tune_frame = ttk.LabelFrame(media_frame, text="Camera Tuning")
+        tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 15))
+
+        ttk.Label(tune_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
+        self.exposure_value_entry = ttk.Entry(tune_frame, width=12)
+        self.exposure_value_entry.grid(row=1, column=0, sticky="ew")
+        self.exposure_apply_button = ttk.Button(tune_frame, text="Apply Exposure", command=lambda: self.apply_value_from_entry("Exposure"))
+        self.exposure_apply_button.grid(row=1, column=1, padx=(8, 0), sticky="ew")
+        self.exposure_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.exposure_range_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(tune_frame, text="Gain").grid(row=3, column=0, sticky="w", pady=(14, 0))
+        self.gain_value_entry = ttk.Entry(tune_frame, width=12)
+        self.gain_value_entry.grid(row=4, column=0, sticky="ew")
+        self.gain_apply_button = ttk.Button(tune_frame, text="Apply Gain", command=lambda: self.apply_value_from_entry("Gain"))
+        self.gain_apply_button.grid(row=4, column=1, padx=(8, 0), sticky="ew")
+        self.gain_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.gain_range_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.refresh_camera_settings_button = ttk.Button(tune_frame, text="Refresh Camera Values", command=self.update_camera_settings_label)
+        self.refresh_camera_settings_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+
+        self.camera_settings_label = ttk.Label(tune_frame, text="Exposure: -- | Gain: --", font=self.small_font, cursor="hand2")
+        self.camera_settings_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(15, 0))
+        self.camera_settings_label.bind("<Double-Button-1>", self.prompt_set_exposure_and_gain)
+
+        self.video_panel = ttk.Label(media_frame)
+        self.video_panel.grid(row=0, column=1, sticky="n")
 
         self.fps_label = ttk.Label(self.root, text="FPS: --", font=self.small_font)
         self.fps_label.pack()
@@ -852,6 +1008,7 @@ class App:
         self.debug_checkbox.grid(row=1, column=8, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
+        self.update_camera_settings_label()
         self.last_display_time = None
         self.last_display_fps = None
 
@@ -936,6 +1093,132 @@ class App:
         self.frame_interval_ms = int(1000.0 / fps)
         if any(setup.recording for setup in self.setups):
             messagebox.showinfo("FPS Updated", "Display FPS updated now. Video FPS will apply on next recording.")
+
+    def persist_setup_capture_settings(self, setup):
+        config = configparser.ConfigParser()
+        config.read(self.config_path)
+        if setup.config_section not in config:
+            config[setup.config_section] = {}
+        section = config[setup.config_section]
+        for key, value in setup.capture_settings.items():
+            if value is None:
+                if key in section:
+                    section[key] = ""
+            else:
+                if isinstance(value, str):
+                    section[key] = value
+                else:
+                    numeric = float(value)
+                    if numeric.is_integer():
+                        section[key] = str(int(numeric))
+                    else:
+                        section[key] = str(numeric)
+        with open(self.config_path, "w") as config_file:
+            config.write(config_file)
+
+    def update_camera_settings_label(self):
+        setup = self.setups[self.current_setup]
+        exposure = setup.capture_settings.get("Exposure")
+        gain = setup.capture_settings.get("Gain")
+        exposure_limits = setup.property_limits.get("Exposure", (None, None))
+        gain_limits = setup.property_limits.get("Gain", (None, None))
+        with setup.capture_lock:
+            if setup.cap is not None and setup.cap.isOpened():
+                exposure = setup.cap.get(cv2.CAP_PROP_EXPOSURE)
+                gain = setup.cap.get(cv2.CAP_PROP_GAIN)
+                setup.capture_settings["Exposure"] = exposure
+                setup.capture_settings["Gain"] = gain
+        exposure_text = "--" if exposure is None else f"{exposure:.4f}"
+        gain_text = "--" if gain is None else f"{gain:.4f}"
+        self.camera_settings_label.config(text=f"Exposure: {exposure_text} | Gain: {gain_text}")
+        self.exposure_value_entry.delete(0, tk.END)
+        self.exposure_value_entry.insert(0, "" if exposure is None else f"{exposure:.4f}")
+        self.gain_value_entry.delete(0, tk.END)
+        self.gain_value_entry.insert(0, "" if gain is None else f"{gain:.4f}")
+        exp_min, exp_max = exposure_limits
+        gain_min, gain_max = gain_limits
+        self.exposure_range_label.config(
+            text="Range: --" if exp_min is None or exp_max is None else f"Range: {exp_min:.4f} to {exp_max:.4f}"
+        )
+        self.gain_range_label.config(
+            text="Range: --" if gain_min is None or gain_max is None else f"Range: {gain_min:.4f} to {gain_max:.4f}"
+        )
+
+    def apply_value_from_entry(self, setting_name):
+        entry = self.exposure_value_entry if setting_name == "Exposure" else self.gain_value_entry
+        try:
+            requested_value = float(entry.get())
+        except ValueError:
+            messagebox.showerror("Invalid Value", f"Enter a numeric {setting_name.lower()} value.")
+            return
+        self.set_current_camera_setting(setting_name, requested_value)
+
+    def set_current_camera_setting(self, setting_name, requested_value):
+        setup = self.setups[self.current_setup]
+        self.ensure_setup_capture(setup)
+        prop_map = {
+            "Exposure": cv2.CAP_PROP_EXPOSURE,
+            "Gain": cv2.CAP_PROP_GAIN,
+        }
+        with setup.capture_lock:
+            if setup.cap is None or not setup.cap.isOpened():
+                messagebox.showerror("Camera Unavailable", f"{setup.name}: camera is not open.")
+                return None
+            if setting_name == "Exposure":
+                setup.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, -1)
+                setup.capture_settings["AutoExposure"] = -1.0
+            ok = setup.cap.set(prop_map[setting_name], requested_value)
+            applied_value = setup.cap.get(prop_map[setting_name])
+
+        if not ok:
+            self.log(
+                f"{setup.name}: failed to set {setting_name} to {requested_value:.4f}; reported {applied_value:.4f}",
+                level="WARNING"
+            )
+        else:
+            self.log(
+                f"{setup.name}: set {setting_name} target={requested_value:.4f}, reported={applied_value:.4f}",
+                level="INFO"
+            )
+
+        setup.capture_settings[setting_name] = applied_value
+        self.persist_setup_capture_settings(setup)
+        self.update_camera_settings_label()
+        return applied_value
+
+    def prompt_set_exposure_and_gain(self, _event=None):
+        setup = self.setups[self.current_setup]
+        self.ensure_setup_capture(setup)
+        with setup.capture_lock:
+            if setup.cap is None or not setup.cap.isOpened():
+                messagebox.showerror("Camera Unavailable", f"{setup.name}: camera is not open.")
+                return
+            current_exposure = setup.cap.get(cv2.CAP_PROP_EXPOSURE)
+            current_gain = setup.cap.get(cv2.CAP_PROP_GAIN)
+
+        requested_exposure = simpledialog.askfloat(
+            "Set Exposure",
+            f"{setup.name}: enter exposure value",
+            initialvalue=current_exposure,
+            parent=self.root,
+        )
+        if requested_exposure is None:
+            return
+
+        applied_exposure = self.set_current_camera_setting("Exposure", requested_exposure)
+        if applied_exposure is None:
+            return
+
+        requested_gain = simpledialog.askfloat(
+            "Set Gain",
+            f"{setup.name}: enter gain value",
+            initialvalue=current_gain,
+            parent=self.root,
+        )
+        if requested_gain is None:
+            return
+
+        self.set_current_camera_setting("Gain", requested_gain)
 
     def generate_and_register_exp(self, mouse_id):
         try:
@@ -1070,17 +1353,12 @@ class App:
         return paths
 
     def enumerate_camera_entries(self):
-        paths = self.get_directshow_device_paths()
-        max_index = min(16, max(4, len(paths)))
         entries = []
-        for index in range(max_index):
-            cap = self.open_capture(index)
-            if cap.isOpened():
-                cap.release()
-                path = paths[index] if index < len(paths) else ""
-                entries.append({"id": index, "path": path})
-            else:
-                cap.release()
+        for index, device in enumerate(self.ic4_device_infos, start=1 if self.camera_id_mode == "one_based_index" else 0):
+            entries.append({
+                "id": index,
+                "path": f"{device.model_name} / {device.serial}",
+            })
         return entries
 
     def show_camera_streams(self):
@@ -1157,6 +1435,7 @@ class App:
         self.duration_entry.insert(0, str(setup.session_duration))
         self.update_setup_label()
         self.update_lock_state_button()
+        self.update_camera_settings_label()
 
     def on_closing(self):
         self.running = False
@@ -1164,6 +1443,8 @@ class App:
         for setup in self.setups:
             setup.stop_recording()
             setup.release_capture()
+        self.ic4_device_infos = []
+        ic4.Library.exit()
         self.root.destroy()
 
 if __name__ == '__main__':

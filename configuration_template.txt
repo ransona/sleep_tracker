@@ -5,12 +5,24 @@ ExperimentListDirectory = \\ar-lab-nas1\\DataServer\\Remote_Repository\\habituat
 
 [Top Left]
 CameraID = 0
+DeviceSerial =
 COMPort = COM10
 FlipHorizontal = False
 FlipVertical = False
+UserSet =
+AutoExposure =
+Exposure =
+Gain =
+Contrast =
 
 [Top Right]
 CameraID = 1
+DeviceSerial =
 COMPort = COM11
 FlipHorizontal = False
 FlipVertical = False
+UserSet =
+AutoExposure =
+Exposure =
+Gain =
+Contrast =

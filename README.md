@@ -12,14 +12,32 @@ RootDirectory = C:/Your/Desired/Output/Folder
 
 [Setup0]
 CameraID = 0
+DeviceSerial =
 COMPort = COM3
+UserSet =
+AutoExposure =
+Exposure =
+Gain =
+Contrast =
 
 [Setup1]
 CameraID = 1
+DeviceSerial =
 COMPort = COM4
+UserSet =
+AutoExposure =
+Exposure =
+Gain =
+Contrast =
 CameraID: Index of the USB camera (0, 1, etc. — verify with a test script).
 
+DeviceSerial: Optional Imaging Source camera serial number. If provided, it takes precedence over CameraID and gives stable camera selection across reboots.
+
+UserSet: Optional Imaging Source user set name to load when the camera opens, for example `UserSet1`. The GUI loads this first, then applies any explicit AutoExposure / Exposure / Gain overrides from the config.
+
 COMPort: The COM port of the Arduino associated with that camera (e.g., COM3).
+
+AutoExposure / Exposure / Gain / Contrast: Optional startup settings applied each time the camera capture is opened or reopened. Leave blank to keep the driver default. Values are passed directly to OpenCV camera properties, so the exact scale is camera/driver dependent.
 
 Add as many setups as needed using [Setup2], [Setup3], etc.
 
