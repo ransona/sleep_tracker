@@ -318,10 +318,6 @@ class CameraSetup:
         return True
 
     def update_fps_diagnostic(self, read_complete, ret):
-        if self.low_fps_enabled is not None and not self.low_fps_enabled():
-            self.reset_fps_diagnostic()
-            return
-
         if self.last_read_complete_time is None:
             self.last_read_complete_time = read_complete
             return
@@ -332,6 +328,12 @@ class CameraSetup:
             return
 
         self.last_effective_fps = 1.0 / delta
+        diagnostics_enabled = self.low_fps_enabled is None or self.low_fps_enabled()
+        if not diagnostics_enabled:
+            self.low_fps_since = None
+            self.low_fps_warning_sent = False
+            return
+
         is_low_fps = (not ret) or (self.last_effective_fps < LOW_FPS_THRESHOLD)
 
         if is_low_fps:
@@ -898,12 +900,12 @@ class App:
             foreground=color
         )
         self.update_setup_label()
-        if setup.recording and setup.last_write_fps is not None:
-            self.fps_label.config(text=f"Write FPS: {setup.last_write_fps:.1f}")
-        elif setup.last_effective_fps is not None:
-            self.fps_label.config(text=f"Acquire FPS: {setup.last_effective_fps:.1f}")
-        elif self.last_display_fps is not None:
-            self.fps_label.config(text=f"Display FPS: {self.last_display_fps:.1f}")
+        fps_parts = []
+        if setup.last_effective_fps is not None:
+            fps_parts.append(f"Acquire FPS: {setup.last_effective_fps:.1f}")
+        if setup.last_write_fps is not None:
+            fps_parts.append(f"Write FPS: {setup.last_write_fps:.1f}")
+        self.fps_label.config(text=" | ".join(fps_parts) if fps_parts else "FPS: --")
 
         if self.running:
             self.root.after(self.frame_interval_ms, self.update_video)
