@@ -12,7 +12,7 @@ from typing import List, Set, Tuple
 # Defaults for watcher behavior when not provided by the YAML config.
 DEFAULT_CONFIG_PATH = "habituation_watcher.yaml"
 DEFAULT_PROCESSED_PATH = "/data/common/habituation/already_processed.txt"
-DEFAULT_POLL_INTERVAL_SECONDS = 300
+DEFAULT_POLL_INTERVAL_SECONDS = 1200
 DEFAULT_LOG_PATH = "/data/common/habituation/habituation_watcher.log"
 DEFAULT_SIMULATE = False
 DEFAULT_REMOTE_REPOSITORY_ROOT = "/data/Remote_Repository"
