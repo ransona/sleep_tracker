@@ -87,15 +87,22 @@ python habituation_watcher.py --config habituation_watcher.yaml
 Config example (`habituation_watcher.yaml`):
 - `experiment_list_path`: path to the shared `exp_list.txt` (CSV rows: expID,timestamp, no header).
 - `processed_list_path`: file tracking processed IDs (default `/data/common/habituation/already_processed.txt`).
-- `poll_interval_seconds`: seconds between polls (first poll runs immediately; default 60).
+- `poll_interval_seconds`: seconds between polls (first poll runs immediately; default 1200).
 - `log_path`: log file path (default `/data/common/habituation/habituation_watcher.log`).
+- `remote_repository_root`: root path containing habituation experiment folders under `[animalID]/[expID]` (default `/data/Remote_Repository`).
 - `simulate`: true/false to log what would be enqueued without actually adding to the queue.
 
 Behavior:
 - Loads processed IDs (creates directories as needed).
+- Stores processed IDs in `processed_list_path` as plain text, one `expID` per line.
+- On startup, reads that file into memory and skips any IDs already listed there.
 - Reads exp IDs from the CSV first column.
+- Resolves each experiment folder as `remote_repository_root/[animalID]/[expID]`.
+- Requires `file_check_habituate.txt` to exist and match the listed file sizes before queueing.
+- Leaves incomplete experiments unprocessed so they are retried on later polls.
+- Between polls, shows a countdown in the terminal and lets an interactive user press Enter to poll immediately.
 - For each new ID, builds `step1_config` with:
-  - `userID` = current user
+  - `userID` = `machine-pipeline-access`
   - `expIDs` = [expID]
   - `suite2p_config` = ""
   - `runs2p` = False
