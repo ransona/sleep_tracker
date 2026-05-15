@@ -1,5 +1,6 @@
-experiment_list_path: /data/common/habituation/exp_list.txt
+experiment_list_path: /data/Remote_Repository/habituation/exp_list.txt
 processed_list_path: /data/common/habituation/already_processed.txt
-poll_interval_seconds: 60
+poll_interval_seconds: 1200
 log_path: /data/common/habituation/habituation_watcher.log
+remote_repository_root: /data/Remote_Repository
 simulate: false
