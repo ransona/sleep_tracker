@@ -52,9 +52,8 @@ def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
     safe_mouse_id = mouse_id if mouse_id else "unknown"
     animal_dir = os.path.join(root_dir, safe_mouse_id, exp_id)
     os.makedirs(animal_dir, exist_ok=True)
-    safe_setup = str(setup_index).replace(" ", "_")
-    video_path = os.path.join(animal_dir, f"{exp_id}_{safe_setup}_habit.mp4")
-    csv_path = os.path.join(animal_dir, f"{exp_id}_{safe_setup}_frame_times.csv")
+    video_path = os.path.join(animal_dir, f"{exp_id}_habit.mp4")
+    csv_path = os.path.join(animal_dir, f"{exp_id}_frame_times.csv")
     return video_path, csv_path
 
 
@@ -1278,12 +1277,17 @@ class App:
         self.duration_entry.delete(0, tk.END)
         self.duration_entry.insert(0, str(session_duration))
 
-        exp_id, _remote_exp_dir = self.generate_and_register_exp(mouse_id)
+        exp_ids = []
         for setup in self.setups:
+            exp_id, _remote_exp_dir = self.generate_and_register_exp(mouse_id)
             self.ensure_setup_capture(setup)
             self.start_setup_recording(setup, mouse_id, session_duration, exp_id)
+            exp_ids.append(f"{setup.name or setup.cam_id}={exp_id}")
         self.log(
-            f"Started test-system acquisition on {len(self.setups)} setups for {session_duration} minutes under expID '{exp_id}'.",
+            (
+                f"Started test-system acquisition on {len(self.setups)} setups for "
+                f"{session_duration} minutes with expIDs: {', '.join(exp_ids)}."
+            ),
             level="WARNING"
         )
         self.update_setup_label()
