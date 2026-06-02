@@ -20,28 +20,28 @@ PIPELINE_USER = "machine-pipeline-access"
 FILE_CHECK_NAME = "file_check_habituate.txt"
 
 try:
-    from preprocess_scripts import run_step1_batch
+    from preprocess_pipeline.step1 import run_batch
 except ModuleNotFoundError:
-    # Support running this script directly when preprocess_scripts is a sibling repo.
+    # Support running this script directly when lab_pipeline is a sibling repo.
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate_parents = [
-        os.path.abspath(os.path.join(script_dir, "..")),
-        os.environ.get("PREPROCESS_SCRIPTS_PARENT", ""),
+    candidate_src_roots = [
+        os.path.abspath(os.path.join(script_dir, "..", "lab_pipeline", "src")),
+        os.environ.get("LAB_PIPELINE_SRC", ""),
     ]
-    for parent in candidate_parents:
-        if not parent:
+    for src_root in candidate_src_roots:
+        if not src_root:
             continue
-        if os.path.isdir(os.path.join(parent, "preprocess_scripts")):
-            if parent not in sys.path:
-                sys.path.insert(0, parent)
+        if os.path.isdir(os.path.join(src_root, "preprocess_pipeline")):
+            if src_root not in sys.path:
+                sys.path.insert(0, src_root)
             break
 
     try:
-        from preprocess_scripts import run_step1_batch
+        from preprocess_pipeline.step1 import run_batch
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "Could not import preprocess_scripts. Add its parent directory to "
-            "PYTHONPATH or set PREPROCESS_SCRIPTS_PARENT."
+            "Could not import lab_pipeline. Add its src directory to "
+            "PYTHONPATH or set LAB_PIPELINE_SRC."
         ) from exc
 
 
@@ -243,7 +243,7 @@ def enqueue_exp(logger: logging.Logger, exp_id: str, simulate: bool) -> None:
         )
         return
     logger.info("Enqueuing exp_id=%s for user=%s", exp_id, PIPELINE_USER)
-    run_step1_batch.run_step1_batch(step1_config)
+    run_batch.run_step1_batch_universal(step1_config)
 
 
 def run_loop(cfg: WatcherConfig) -> None:
