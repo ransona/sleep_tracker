@@ -95,7 +95,7 @@ Auto cycle is just for viewing — it does not affect recording logic.
 Each setup retains its own Mouse ID and session duration across switching.
 
 ## Habituation watcher (server)
-`habituation_watcher.py` watches the shared experiment list and enqueues new IDs into the preprocessing queue via `preprocess_scripts/run_step1_batch.py`.
+`habituation_watcher.py` watches the shared experiment list and enqueues new IDs into the `lab_pipeline` preprocessing queue via `preprocess_pipeline.step1.run_batch.run_step1_batch_universal`.
 
 Run:
 ```
@@ -127,5 +127,5 @@ Behavior:
   - `rundlc` = True
   - `runfitpupil` = True
   - `runhabituate` = True
-- Calls `run_step1_batch`, then records the ID as processed.
+- Calls `run_step1_batch_universal`, then records the ID as processed. The queued job is a normal Step 1 job with `runhabituate=True`; the queue listener skips the standard NAS/camera integrity checks for that job and the Step 1 runtime runs habituation processing at the end.
 - Logs to stdout and the log file.
