@@ -974,29 +974,45 @@ class App:
         media_frame = ttk.Frame(self.root)
         media_frame.pack(padx=10, pady=10)
 
+        button_style = ttk.Style(self.root)
+        button_style.configure("App.Big.TButton", padding=(12, 7))
+        button_style.configure("App.Big.TCheckbutton", padding=(10, 5))
+
         tune_frame = ttk.LabelFrame(media_frame, text="Camera Tuning")
         tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 15))
+        self.camera_settings_visible = True
 
-        ttk.Label(tune_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
-        self.exposure_value_entry = ttk.Entry(tune_frame, width=12)
+        self.camera_settings_toggle_button = ttk.Button(
+            tune_frame,
+            text="Hide Camera Settings",
+            command=self.toggle_camera_settings_visibility,
+            style="App.Big.TButton",
+        )
+        self.camera_settings_toggle_button.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+
+        self.camera_settings_frame = ttk.Frame(tune_frame)
+        self.camera_settings_frame.grid(row=1, column=0, columnspan=2, sticky="nw", padx=8, pady=(0, 8))
+
+        ttk.Label(self.camera_settings_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
+        self.exposure_value_entry = ttk.Entry(self.camera_settings_frame, width=12)
         self.exposure_value_entry.grid(row=1, column=0, sticky="ew")
-        self.exposure_apply_button = ttk.Button(tune_frame, text="Apply Exposure", command=lambda: self.apply_value_from_entry("Exposure"))
+        self.exposure_apply_button = ttk.Button(self.camera_settings_frame, text="Apply Exposure", command=lambda: self.apply_value_from_entry("Exposure"), style="App.Big.TButton")
         self.exposure_apply_button.grid(row=1, column=1, padx=(8, 0), sticky="ew")
-        self.exposure_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.exposure_range_label = ttk.Label(self.camera_settings_frame, text="Range: --", font=self.small_font)
         self.exposure_range_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(tune_frame, text="Gain").grid(row=3, column=0, sticky="w", pady=(14, 0))
-        self.gain_value_entry = ttk.Entry(tune_frame, width=12)
+        ttk.Label(self.camera_settings_frame, text="Gain").grid(row=3, column=0, sticky="w", pady=(14, 0))
+        self.gain_value_entry = ttk.Entry(self.camera_settings_frame, width=12)
         self.gain_value_entry.grid(row=4, column=0, sticky="ew")
-        self.gain_apply_button = ttk.Button(tune_frame, text="Apply Gain", command=lambda: self.apply_value_from_entry("Gain"))
+        self.gain_apply_button = ttk.Button(self.camera_settings_frame, text="Apply Gain", command=lambda: self.apply_value_from_entry("Gain"), style="App.Big.TButton")
         self.gain_apply_button.grid(row=4, column=1, padx=(8, 0), sticky="ew")
-        self.gain_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.gain_range_label = ttk.Label(self.camera_settings_frame, text="Range: --", font=self.small_font)
         self.gain_range_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        self.refresh_camera_settings_button = ttk.Button(tune_frame, text="Refresh Camera Values", command=self.update_camera_settings_label)
+        self.refresh_camera_settings_button = ttk.Button(self.camera_settings_frame, text="Refresh Camera Values", command=self.update_camera_settings_label, style="App.Big.TButton")
         self.refresh_camera_settings_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
-        self.camera_settings_label = ttk.Label(tune_frame, text="Exposure: -- | Gain: --", font=self.small_font, cursor="hand2")
+        self.camera_settings_label = ttk.Label(self.camera_settings_frame, text="Exposure: -- | Gain: --", font=self.small_font, cursor="hand2")
         self.camera_settings_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(15, 0))
         self.camera_settings_label.bind("<Double-Button-1>", self.prompt_set_exposure_and_gain)
 
@@ -1025,19 +1041,19 @@ class App:
         button_frame = ttk.Frame(control_frame)
         button_frame.pack()
 
-        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_recording)
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_recording, style="App.Big.TButton")
         self.start_button.grid(row=0, column=0)
-        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording)
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording, style="App.Big.TButton")
         self.stop_button.grid(row=0, column=1)
-        self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup)
+        self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup, style="App.Big.TButton")
         self.left_button.grid(row=0, column=2)
-        self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup)
+        self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup, style="App.Big.TButton")
         self.right_button.grid(row=0, column=3)
-        self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system)
+        self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system, style="App.Big.TButton")
         self.test_button.grid(row=0, column=4, padx=(10, 0))
 
         self.auto_cycle_var = tk.BooleanVar()
-        self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle)
+        self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle, style="App.Big.TCheckbutton")
         self.auto_cycle_button.grid(row=0, column=5)
 
         self.dwell_label = ttk.Label(button_frame, text="Dwell (s):")
@@ -1058,14 +1074,14 @@ class App:
                 self.lock_state_control_frame,
                 text=label,
                 command=lambda s=state: self.set_lock_state(s),
-                padx=12,
-                pady=6,
+                padx=8,
+                pady=3,
                 relief="raised",
-                bd=2,
+                bd=1,
                 highlightthickness=0,
                 takefocus=False,
             )
-            button.grid(row=0, column=idx, padx=4, pady=4, sticky="ew")
+            button.grid(row=0, column=idx, padx=3, pady=2, sticky="ew")
             self.lock_state_buttons[state] = button
 
         self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
@@ -1073,7 +1089,7 @@ class App:
         self.fps_entry = ttk.Entry(button_frame, width=6)
         self.fps_entry.insert(0, str(self.record_fps))
         self.fps_entry.grid(row=2, column=1, pady=(10, 0))
-        self.fps_apply_button = ttk.Button(button_frame, text="Apply FPS", command=self.apply_fps)
+        self.fps_apply_button = ttk.Button(button_frame, text="Apply FPS", command=self.apply_fps, style="App.Big.TButton")
         self.fps_apply_button.grid(row=2, column=2, columnspan=2, padx=(5, 0), pady=(10, 0))
 
         self.debug_var = tk.BooleanVar()
@@ -1081,6 +1097,7 @@ class App:
         self.debug_checkbox.grid(row=1, column=8, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
+        self._update_camera_settings_toggle_button()
         self.update_camera_settings_label()
         self.last_display_time = None
         self.last_display_fps = None
@@ -1168,6 +1185,20 @@ class App:
         self.frame_interval_ms = int(1000.0 / fps)
         if any(setup.recording for setup in self.setups):
             messagebox.showinfo("FPS Updated", "Display FPS updated now. Video FPS will apply on next recording.")
+
+    def toggle_camera_settings_visibility(self):
+        self.camera_settings_visible = not self.camera_settings_visible
+        if self.camera_settings_visible:
+            self.camera_settings_frame.grid()
+        else:
+            self.camera_settings_frame.grid_remove()
+        self._update_camera_settings_toggle_button()
+
+    def _update_camera_settings_toggle_button(self):
+        if hasattr(self, "camera_settings_toggle_button"):
+            self.camera_settings_toggle_button.config(
+                text="Hide Camera Settings" if self.camera_settings_visible else "Show Camera Settings"
+            )
 
     def persist_setup_capture_settings(self, setup):
         config = configparser.ConfigParser()
@@ -1533,6 +1564,7 @@ class App:
         self.duration_entry.insert(0, str(setup.session_duration))
         self.update_setup_label()
         self.update_lock_state_button()
+        self._update_camera_settings_toggle_button()
         self.update_camera_settings_label()
 
     def on_closing(self):
