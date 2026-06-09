@@ -18,13 +18,13 @@ import imagingcontrol4 as ic4
 CAPTURE_BACKEND_NAME = "DSHOW"
 CAPTURE_BACKEND = cv2.CAP_DSHOW
 LOCK_STATE_SEQUENCE = ("automatic", "unlocked", "locked")
-LOCK_STATE_TO_INDEX = {state: idx for idx, state in enumerate(LOCK_STATE_SEQUENCE)}
-LOCK_STATE_FROM_INDEX = {idx: state for state, idx in LOCK_STATE_TO_INDEX.items()}
 LOCK_STATE_COLORS = {
     "automatic": ("Automatic", "blue", "white"),
     "unlocked": ("Unlocked", "green", "white"),
     "locked": ("Locked", "red", "white"),
 }
+LOCK_STATE_INACTIVE_BG = "#efefef"
+LOCK_STATE_INACTIVE_FG = "#333333"
 
 
 def normalize_lock_state(value):
@@ -1027,39 +1027,27 @@ class App:
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=7)
 
-        self.lock_state_control_frame = ttk.Frame(button_frame)
+        self.lock_state_control_frame = ttk.LabelFrame(button_frame, text="Lock mode")
         self.lock_state_control_frame.grid(row=1, column=0, columnspan=8, pady=(10, 0), sticky="ew")
-        self.lock_state_control_frame.columnconfigure(0, weight=1)
-        self.lock_state_control_frame.columnconfigure(1, weight=1)
-        self.lock_state_control_frame.columnconfigure(2, weight=1)
+        for idx in range(3):
+            self.lock_state_control_frame.columnconfigure(idx, weight=1)
 
-        self.lock_state_label = tk.Label(self.lock_state_control_frame, text="Automatic", bg="blue", fg="white", padx=12, pady=4)
-        self.lock_state_label.grid(row=0, column=0, columnspan=3, pady=(0, 6), sticky="ew")
-
-        self.lock_state_slider_var = tk.IntVar(value=LOCK_STATE_TO_INDEX["automatic"])
-        self.lock_state_slider = tk.Scale(
-            self.lock_state_control_frame,
-            from_=0,
-            to=2,
-            orient="horizontal",
-            showvalue=False,
-            resolution=1,
-            length=260,
-            variable=self.lock_state_slider_var,
-            command=self.on_lock_state_slider_moved,
-            troughcolor="#d9d9d9",
-            highlightthickness=0,
-        )
-        self.lock_state_slider.grid(row=1, column=0, columnspan=3, sticky="ew")
-        self.lock_state_slider.bind("<ButtonRelease-1>", self.on_lock_state_slider_released)
-        self.lock_state_slider.bind("<KeyRelease-Left>", self.on_lock_state_slider_released)
-        self.lock_state_slider.bind("<KeyRelease-Right>", self.on_lock_state_slider_released)
-
-        self.lock_state_ticks = ttk.Frame(self.lock_state_control_frame)
-        self.lock_state_ticks.grid(row=2, column=0, columnspan=3, sticky="ew")
-        ttk.Label(self.lock_state_ticks, text="Automatic").grid(row=0, column=0, sticky="w")
-        ttk.Label(self.lock_state_ticks, text="Unlocked").grid(row=0, column=1)
-        ttk.Label(self.lock_state_ticks, text="Locked").grid(row=0, column=2, sticky="e")
+        self.lock_state_buttons = {}
+        for idx, state in enumerate(LOCK_STATE_SEQUENCE):
+            label, _bg, _fg = LOCK_STATE_COLORS[state]
+            button = tk.Button(
+                self.lock_state_control_frame,
+                text=label,
+                command=lambda s=state: self.set_lock_state(s),
+                padx=12,
+                pady=6,
+                relief="raised",
+                bd=2,
+                highlightthickness=0,
+                takefocus=False,
+            )
+            button.grid(row=0, column=idx, padx=4, pady=4, sticky="ew")
+            self.lock_state_buttons[state] = button
 
         self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
         self.fps_label_entry.grid(row=2, column=0, sticky="e", pady=(10, 0))
@@ -1392,52 +1380,36 @@ class App:
         setup = self.setups[self.current_setup]
         setup.sync_lock_state_from_status()
         state = normalize_lock_state(setup.lock_state) or "automatic"
-        index = LOCK_STATE_TO_INDEX[state]
-        if getattr(self, "lock_state_slider_var", None) is not None:
-            self._lock_state_control_updating = True
-            try:
-                self.lock_state_slider_var.set(index)
-                self.lock_state_slider.set(index)
-            finally:
-                self._lock_state_control_updating = False
-        label, bg, fg = LOCK_STATE_COLORS[state]
-        if hasattr(self, "lock_state_label"):
-            self.lock_state_label.config(text=label, bg=bg, fg=fg)
+        for candidate_state, button in getattr(self, "lock_state_buttons", {}).items():
+            label, _bg, _fg = LOCK_STATE_COLORS[candidate_state]
+            if candidate_state == state:
+                active_bg, active_fg = LOCK_STATE_COLORS[state][1:]
+                button.config(
+                    text=label,
+                    bg=active_bg,
+                    fg=active_fg,
+                    relief="sunken",
+                    bd=3,
+                    activebackground=active_bg,
+                    activeforeground=active_fg,
+                )
+            else:
+                button.config(
+                    text=label,
+                    bg=LOCK_STATE_INACTIVE_BG,
+                    fg=LOCK_STATE_INACTIVE_FG,
+                    relief="raised",
+                    bd=2,
+                    activebackground=LOCK_STATE_INACTIVE_BG,
+                    activeforeground=LOCK_STATE_INACTIVE_FG,
+                )
 
-    def on_lock_state_slider_moved(self, _value):
-        if getattr(self, "_lock_state_control_updating", False):
-            return
-        self._update_lock_state_label_from_slider(preview=True)
-
-    def on_lock_state_slider_released(self, _event=None):
-        if getattr(self, "_lock_state_control_updating", False):
-            return
-        self.apply_lock_state_from_slider()
-
-    def _update_lock_state_label_from_slider(self, preview=False):
+    def set_lock_state(self, state):
         setup = self.setups[self.current_setup]
-        index = self._current_lock_state_index_from_slider()
-        state = LOCK_STATE_FROM_INDEX.get(index, "automatic")
-        label, bg, fg = LOCK_STATE_COLORS[state]
-        if preview or state != normalize_lock_state(setup.lock_state):
-            self.lock_state_label.config(text=label, bg=bg, fg=fg)
-        else:
-            self.lock_state_label.config(text=label, bg=bg, fg=fg)
-
-    def _current_lock_state_index_from_slider(self):
-        try:
-            value = int(round(float(self.lock_state_slider_var.get())))
-        except Exception:
-            value = 0
-        return min(max(value, 0), len(LOCK_STATE_SEQUENCE) - 1)
-
-    def apply_lock_state_from_slider(self):
-        setup = self.setups[self.current_setup]
-        index = self._current_lock_state_index_from_slider()
-        state = LOCK_STATE_FROM_INDEX.get(index, "automatic")
+        normalized_state = normalize_lock_state(state) or "automatic"
         setup.lock_state_user_overridden = True
         setup.lock_state_synced_from_hardware = True
-        setup.lock_state = state
+        setup.lock_state = normalized_state
         setup.send_lock_state(log_fn=self.debug_log)
         self.update_lock_state_button()
 
