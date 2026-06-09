@@ -17,6 +17,23 @@ import imagingcontrol4 as ic4
 
 CAPTURE_BACKEND_NAME = "DSHOW"
 CAPTURE_BACKEND = cv2.CAP_DSHOW
+LOCK_STATE_SEQUENCE = ("automatic", "unlocked", "locked")
+LOCK_STATE_TO_INDEX = {state: idx for idx, state in enumerate(LOCK_STATE_SEQUENCE)}
+LOCK_STATE_FROM_INDEX = {idx: state for state, idx in LOCK_STATE_TO_INDEX.items()}
+LOCK_STATE_COLORS = {
+    "automatic": ("Automatic", "blue", "white"),
+    "unlocked": ("Unlocked", "green", "white"),
+    "locked": ("Locked", "red", "white"),
+}
+
+
+def normalize_lock_state(value):
+    if value is None:
+        return None
+    state = str(value).strip().lower()
+    return state if state in LOCK_STATE_SEQUENCE else None
+
+
 def parse_bool(value, default=False):
     """Return a best-effort bool from config text."""
     if value is None:
@@ -361,6 +378,8 @@ class CameraSetup:
         self.session_duration = 0  # in minutes
         self.exp_id = ""
         self.lock_state = "automatic"
+        self.lock_state_synced_from_hardware = False
+        self.lock_state_user_overridden = False
         self.latest_status = None
         self.last_arduino_line = ""
         self.last_logged_arduino_line = ""
@@ -432,8 +451,12 @@ class CameraSetup:
     def start_recording(self, mouse_id, session_duration, exp_id, record_fps=10.0):
         self.mouse_id = mouse_id
         self.session_duration = session_duration
-        self.start_time = time.time()
-        self.record_interval_s = 1.0 / max(record_fps, 0.1)
+        self.record_fps = max(record_fps, 0.1)
+        self.record_interval_s = 1.0 / self.record_fps
+        self.recorded_frame_count = 0
+        self.last_write_time = None
+        self.last_write_fps = None
+        self.elapsed_time = 0
         output_id = self.name or f"camera_{self.cam_id}"
         video_path, csv_path = generate_file_paths(mouse_id, exp_id, output_id, self.root_dir)
         meta_path = os.path.join(os.path.dirname(video_path), f"{exp_id}_meta.txt")
@@ -442,7 +465,7 @@ class CameraSetup:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter(video_path, fourcc, record_fps, (width, height))
+        self.writer = cv2.VideoWriter(video_path, fourcc, self.record_fps, (width, height))
         self.csv_file = open(csv_path, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'arduino_data'])
@@ -511,6 +534,7 @@ class CameraSetup:
             with self.frame_lock:
                 self.latest_frame = frame.copy()
                 self.latest_frame_time = read_complete
+            self.sync_lock_state_from_status()
             return True
         return False
 
@@ -530,11 +554,11 @@ class CameraSetup:
         if not self.recording or self.writer is None or self.csv_writer is None:
             return False
 
-        frame, frame_time = self.get_latest_frame_packet()
+        frame, _ = self.get_latest_frame_packet()
         if frame is None:
             return False
 
-        timestamp = 0.0 if self.start_time is None else max(0.0, frame_time - self.start_time)
+        timestamp = self.recorded_frame_count / self.record_fps if self.record_fps > 0 else 0.0
         self.writer.write(frame)
         now = time.time()
         if self.last_write_time is not None:
@@ -544,6 +568,7 @@ class CameraSetup:
         self.last_write_time = now
         self.csv_writer.writerow([timestamp, self.last_arduino_line])
         self.elapsed_time = int(timestamp)
+        self.recorded_frame_count += 1
         return True
 
     def update_fps_diagnostic(self, read_complete, ret):
@@ -567,7 +592,18 @@ class CameraSetup:
             return None
         brake_raw, wheel_pos, mode = parts
         brake_text = "locked" if brake_raw == "0" else "unlocked" if brake_raw == "1" else brake_raw
-        return (brake_text, wheel_pos, mode)
+        return (brake_text, wheel_pos, normalize_lock_state(mode) or mode)
+
+    def sync_lock_state_from_status(self):
+        if self.lock_state_synced_from_hardware or self.lock_state_user_overridden or self.latest_status is None:
+            return False
+        mode = normalize_lock_state(self.latest_status[2])
+        if mode is None:
+            return False
+        changed = self.lock_state != mode
+        self.lock_state = mode
+        self.lock_state_synced_from_hardware = True
+        return changed
 
     def send_lock_state(self, log_fn=None):
         command_map = {
@@ -991,8 +1027,39 @@ class App:
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=7)
 
-        self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
-        self.lock_state_button.grid(row=1, column=0, columnspan=8, pady=(10, 0))
+        self.lock_state_control_frame = ttk.Frame(button_frame)
+        self.lock_state_control_frame.grid(row=1, column=0, columnspan=8, pady=(10, 0), sticky="ew")
+        self.lock_state_control_frame.columnconfigure(0, weight=1)
+        self.lock_state_control_frame.columnconfigure(1, weight=1)
+        self.lock_state_control_frame.columnconfigure(2, weight=1)
+
+        self.lock_state_label = tk.Label(self.lock_state_control_frame, text="Automatic", bg="blue", fg="white", padx=12, pady=4)
+        self.lock_state_label.grid(row=0, column=0, columnspan=3, pady=(0, 6), sticky="ew")
+
+        self.lock_state_slider_var = tk.IntVar(value=LOCK_STATE_TO_INDEX["automatic"])
+        self.lock_state_slider = tk.Scale(
+            self.lock_state_control_frame,
+            from_=0,
+            to=2,
+            orient="horizontal",
+            showvalue=False,
+            resolution=1,
+            length=260,
+            variable=self.lock_state_slider_var,
+            command=self.on_lock_state_slider_moved,
+            troughcolor="#d9d9d9",
+            highlightthickness=0,
+        )
+        self.lock_state_slider.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.lock_state_slider.bind("<ButtonRelease-1>", self.on_lock_state_slider_released)
+        self.lock_state_slider.bind("<KeyRelease-Left>", self.on_lock_state_slider_released)
+        self.lock_state_slider.bind("<KeyRelease-Right>", self.on_lock_state_slider_released)
+
+        self.lock_state_ticks = ttk.Frame(self.lock_state_control_frame)
+        self.lock_state_ticks.grid(row=2, column=0, columnspan=3, sticky="ew")
+        ttk.Label(self.lock_state_ticks, text="Automatic").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.lock_state_ticks, text="Unlocked").grid(row=0, column=1)
+        ttk.Label(self.lock_state_ticks, text="Locked").grid(row=0, column=2, sticky="e")
 
         self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
         self.fps_label_entry.grid(row=2, column=0, sticky="e", pady=(10, 0))
@@ -1036,6 +1103,8 @@ class App:
         if setup.recording and setup.last_arduino_line and setup.last_arduino_line != setup.last_logged_arduino_line:
             self.debug_log(f"{setup.name}: {setup.last_arduino_line}")
             setup.last_logged_arduino_line = setup.last_arduino_line
+
+        self.update_lock_state_button()
 
         elapsed = setup.elapsed_time if setup.recording else 0
         remaining = max(0, (setup.session_duration * 60) - elapsed)
@@ -1267,6 +1336,8 @@ class App:
     def start_setup_recording(self, setup, mouse_id, session_duration, exp_id):
         setup.exp_id = exp_id
         setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
+        setup.sync_lock_state_from_status()
+        self.update_lock_state_button()
         setup.send_lock_state(log_fn=self.debug_log)
 
     def start_test_system(self):
@@ -1319,22 +1390,54 @@ class App:
 
     def update_lock_state_button(self):
         setup = self.setups[self.current_setup]
-        color_map = {
-            "automatic": ("Automatic", "blue", "white"),
-            "unlocked": ("Unlocked", "green", "white"),
-            "locked": ("Locked", "red", "white"),
-        }
-        label, bg, fg = color_map.get(setup.lock_state, ("Automatic", "blue", "white"))
-        self.lock_state_button.config(text=label, bg=bg, fg=fg)
+        setup.sync_lock_state_from_status()
+        state = normalize_lock_state(setup.lock_state) or "automatic"
+        index = LOCK_STATE_TO_INDEX[state]
+        if getattr(self, "lock_state_slider_var", None) is not None:
+            self._lock_state_control_updating = True
+            try:
+                self.lock_state_slider_var.set(index)
+                self.lock_state_slider.set(index)
+            finally:
+                self._lock_state_control_updating = False
+        label, bg, fg = LOCK_STATE_COLORS[state]
+        if hasattr(self, "lock_state_label"):
+            self.lock_state_label.config(text=label, bg=bg, fg=fg)
 
-    def toggle_lock_state(self):
+    def on_lock_state_slider_moved(self, _value):
+        if getattr(self, "_lock_state_control_updating", False):
+            return
+        self._update_lock_state_label_from_slider(preview=True)
+
+    def on_lock_state_slider_released(self, _event=None):
+        if getattr(self, "_lock_state_control_updating", False):
+            return
+        self.apply_lock_state_from_slider()
+
+    def _update_lock_state_label_from_slider(self, preview=False):
         setup = self.setups[self.current_setup]
-        if setup.lock_state == "automatic":
-            setup.lock_state = "unlocked"
-        elif setup.lock_state == "unlocked":
-            setup.lock_state = "locked"
+        index = self._current_lock_state_index_from_slider()
+        state = LOCK_STATE_FROM_INDEX.get(index, "automatic")
+        label, bg, fg = LOCK_STATE_COLORS[state]
+        if preview or state != normalize_lock_state(setup.lock_state):
+            self.lock_state_label.config(text=label, bg=bg, fg=fg)
         else:
-            setup.lock_state = "automatic"
+            self.lock_state_label.config(text=label, bg=bg, fg=fg)
+
+    def _current_lock_state_index_from_slider(self):
+        try:
+            value = int(round(float(self.lock_state_slider_var.get())))
+        except Exception:
+            value = 0
+        return min(max(value, 0), len(LOCK_STATE_SEQUENCE) - 1)
+
+    def apply_lock_state_from_slider(self):
+        setup = self.setups[self.current_setup]
+        index = self._current_lock_state_index_from_slider()
+        state = LOCK_STATE_FROM_INDEX.get(index, "automatic")
+        setup.lock_state_user_overridden = True
+        setup.lock_state_synced_from_hardware = True
+        setup.lock_state = state
         setup.send_lock_state(log_fn=self.debug_log)
         self.update_lock_state_button()
 
