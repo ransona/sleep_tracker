@@ -105,6 +105,24 @@ def append_exp_list(exp_list_dir, exp_id):
         writer = csv.writer(f)
         writer.writerow([exp_id, datetime.now().isoformat()])
 
+
+class SessionClock:
+    """Recorder-owned monotonic clock shared by the video and CSV outputs."""
+
+    def __init__(self, fps: float):
+        self.reset(fps)
+
+    def reset(self, fps: float):
+        self.fps = max(float(fps), 0.1)
+        self.step_s = 1.0 / self.fps
+        self.frame_index = 0
+
+    def stamp(self) -> float:
+        timestamp = self.frame_index * self.step_s
+        self.frame_index += 1
+        return timestamp
+
+
 # Simulated Arduino for fallback when real one is not found
 class SimulatedArduino:
     def __init__(self):
@@ -374,6 +392,7 @@ class CameraSetup:
         self.csv_writer = None
         self.start_time = None
         self.elapsed_time = 0
+        self.session_clock = None
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
         self.exp_id = ""
@@ -453,7 +472,7 @@ class CameraSetup:
         self.session_duration = session_duration
         self.record_fps = max(record_fps, 0.1)
         self.record_interval_s = 1.0 / self.record_fps
-        self.recorded_frame_count = 0
+        self.session_clock = SessionClock(self.record_fps)
         self.last_write_time = None
         self.last_write_fps = None
         self.elapsed_time = 0
@@ -484,6 +503,7 @@ class CameraSetup:
             self.csv_file.close()
             self.csv_file = None
         self.csv_writer = None
+        self.session_clock = None
 
     def stop_background_recording(self):
         self.recording_stop_event.set()
@@ -558,7 +578,7 @@ class CameraSetup:
         if frame is None:
             return False
 
-        timestamp = self.recorded_frame_count / self.record_fps if self.record_fps > 0 else 0.0
+        timestamp = self.session_clock.stamp() if self.session_clock is not None else 0.0
         self.writer.write(frame)
         now = time.time()
         if self.last_write_time is not None:
@@ -568,7 +588,6 @@ class CameraSetup:
         self.last_write_time = now
         self.csv_writer.writerow([timestamp, self.last_arduino_line])
         self.elapsed_time = int(timestamp)
-        self.recorded_frame_count += 1
         return True
 
     def update_fps_diagnostic(self, read_complete, ret):
