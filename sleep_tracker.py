@@ -972,26 +972,29 @@ class App:
         self.duration_entry.pack()
 
         media_frame = ttk.Frame(self.root)
-        media_frame.pack(padx=10, pady=10)
+        media_frame.pack(fill="x", padx=10, pady=10)
+        media_frame.grid_columnconfigure(0, weight=0)
+        media_frame.grid_columnconfigure(1, weight=1)
 
         button_style = ttk.Style(self.root)
         button_style.configure("App.Big.TButton", padding=(12, 7))
         button_style.configure("App.Big.TCheckbutton", padding=(10, 5))
+        button_style.configure("App.Compact.TButton", padding=(5, 2))
 
         tune_frame = ttk.LabelFrame(media_frame, text="Camera Tuning")
-        tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 15))
+        tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 8))
         self.camera_settings_visible = True
 
         self.camera_settings_toggle_button = ttk.Button(
             tune_frame,
-            text="Hide Camera Settings",
+            text="Hide Settings",
             command=self.toggle_camera_settings_visibility,
-            style="App.Big.TButton",
+            style="App.Compact.TButton",
         )
-        self.camera_settings_toggle_button.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+        self.camera_settings_toggle_button.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 3))
 
         self.camera_settings_frame = ttk.Frame(tune_frame)
-        self.camera_settings_frame.grid(row=1, column=0, columnspan=2, sticky="nw", padx=8, pady=(0, 8))
+        self.camera_settings_frame.grid(row=1, column=0, columnspan=2, sticky="nw", padx=4, pady=(0, 6))
 
         ttk.Label(self.camera_settings_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
         self.exposure_value_entry = ttk.Entry(self.camera_settings_frame, width=12)
@@ -1017,7 +1020,7 @@ class App:
         self.camera_settings_label.bind("<Double-Button-1>", self.prompt_set_exposure_and_gain)
 
         self.video_panel = ttk.Label(media_frame)
-        self.video_panel.grid(row=0, column=1, sticky="n")
+        self.video_panel.grid(row=0, column=1, sticky="")
 
         self.fps_label = ttk.Label(self.root, text="FPS: --", font=self.small_font)
         self.fps_label.pack()
@@ -1197,7 +1200,7 @@ class App:
     def _update_camera_settings_toggle_button(self):
         if hasattr(self, "camera_settings_toggle_button"):
             self.camera_settings_toggle_button.config(
-                text="Hide Camera Settings" if self.camera_settings_visible else "Show Camera Settings"
+                text="Hide Settings" if self.camera_settings_visible else "Show Settings"
             )
 
     def persist_setup_capture_settings(self, setup):
