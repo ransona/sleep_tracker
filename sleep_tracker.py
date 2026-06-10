@@ -17,6 +17,23 @@ import imagingcontrol4 as ic4
 
 CAPTURE_BACKEND_NAME = "DSHOW"
 CAPTURE_BACKEND = cv2.CAP_DSHOW
+LOCK_STATE_SEQUENCE = ("automatic", "unlocked", "locked")
+LOCK_STATE_COLORS = {
+    "automatic": ("Automatic", "blue", "white"),
+    "unlocked": ("Unlocked", "green", "white"),
+    "locked": ("Locked", "red", "white"),
+}
+LOCK_STATE_INACTIVE_BG = "#efefef"
+LOCK_STATE_INACTIVE_FG = "#333333"
+
+
+def normalize_lock_state(value):
+    if value is None:
+        return None
+    state = str(value).strip().lower()
+    return state if state in LOCK_STATE_SEQUENCE else None
+
+
 def parse_bool(value, default=False):
     """Return a best-effort bool from config text."""
     if value is None:
@@ -87,6 +104,31 @@ def append_exp_list(exp_list_dir, exp_id):
     with open(exp_list_path, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([exp_id, datetime.now().isoformat()])
+
+
+class SessionClock:
+    """Recorder-owned monotonic clock shared by the video and CSV outputs."""
+
+    def __init__(self):
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.monotonic()
+
+    def elapsed(self, now=None) -> float:
+        if self.start_time is None:
+            return 0.0
+        if now is None:
+            now = time.monotonic()
+        return max(0.0, now - self.start_time)
+
+    def stamp(self, event_time=None) -> float:
+        if self.start_time is None:
+            return 0.0
+        if event_time is None:
+            event_time = time.monotonic()
+        return max(0.0, event_time - self.start_time)
+
 
 # Simulated Arduino for fallback when real one is not found
 class SimulatedArduino:
@@ -357,10 +399,13 @@ class CameraSetup:
         self.csv_writer = None
         self.start_time = None
         self.elapsed_time = 0
+        self.session_clock = None
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
         self.exp_id = ""
         self.lock_state = "automatic"
+        self.lock_state_synced_from_hardware = False
+        self.lock_state_user_overridden = False
         self.latest_status = None
         self.last_arduino_line = ""
         self.last_logged_arduino_line = ""
@@ -372,6 +417,9 @@ class CameraSetup:
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
+        self.last_stall_warning_time = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
         self.last_read_complete_time = None
         self.last_effective_fps = None
         self.record_interval_s = 0.1
@@ -432,8 +480,16 @@ class CameraSetup:
     def start_recording(self, mouse_id, session_duration, exp_id, record_fps=10.0):
         self.mouse_id = mouse_id
         self.session_duration = session_duration
-        self.start_time = time.time()
-        self.record_interval_s = 1.0 / max(record_fps, 0.1)
+        self.record_fps = max(record_fps, 0.1)
+        self.record_interval_s = 1.0 / self.record_fps
+        self.session_clock = SessionClock()
+        self.session_clock.start()
+        self.last_write_time = None
+        self.last_write_fps = None
+        self.last_stall_warning_time = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
+        self.elapsed_time = 0
         output_id = self.name or f"camera_{self.cam_id}"
         video_path, csv_path = generate_file_paths(mouse_id, exp_id, output_id, self.root_dir)
         meta_path = os.path.join(os.path.dirname(video_path), f"{exp_id}_meta.txt")
@@ -442,7 +498,7 @@ class CameraSetup:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.writer = cv2.VideoWriter(video_path, fourcc, record_fps, (width, height))
+        self.writer = cv2.VideoWriter(video_path, fourcc, self.record_fps, (width, height))
         self.csv_file = open(csv_path, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'arduino_data'])
@@ -461,6 +517,9 @@ class CameraSetup:
             self.csv_file.close()
             self.csv_file = None
         self.csv_writer = None
+        self.session_clock = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
 
     def stop_background_recording(self):
         self.recording_stop_event.set()
@@ -470,12 +529,21 @@ class CameraSetup:
 
     def recording_loop(self):
         while not self.recording_stop_event.is_set() and self.recording:
-            loop_start = time.time()
+            loop_start = time.monotonic()
             self.write_latest_frame()
-            elapsed = time.time() - loop_start
+            elapsed = time.monotonic() - loop_start
             sleep_s = self.record_interval_s - elapsed
             if sleep_s > 0:
                 self.recording_stop_event.wait(sleep_s)
+
+    def _log_frame_stall_warning(self, message):
+        now = time.monotonic()
+        cooldown_s = 5.0
+        if self.last_stall_warning_time is not None and (now - self.last_stall_warning_time) < cooldown_s:
+            return False
+        self.last_stall_warning_time = now
+        self._log(message, level="WARNING")
+        return True
 
     def apply_flips(self, frame):
         if self.flip_horizontal:
@@ -488,29 +556,30 @@ class CameraSetup:
         return frame
 
     def poll_capture(self):
-        frame_start = time.time()
+        frame_start = time.monotonic()
         with self.capture_lock:
             if self.cap is None:
                 return False
             ret, frame = self.cap.read()
-        read_complete = time.time()
+        read_complete = time.monotonic()
         self.last_frame_ms = (read_complete - frame_start) * 1000.0
         self.update_fps_diagnostic(read_complete, ret)
         arduino_data = ""
-        serial_start = time.time()
+        serial_start = time.monotonic()
         with self.serial_lock:
             while self.serial.in_waiting:
                 arduino_data = self.serial.readline().decode().strip()
             if arduino_data:
                 self.latest_status = self.parse_arduino_status(arduino_data)
                 self.last_arduino_line = arduino_data
-        self.last_serial_ms = (time.time() - serial_start) * 1000.0
+        self.last_serial_ms = (time.monotonic() - serial_start) * 1000.0
         if ret:
             frame = self.apply_flips(frame)
             frame = self.annotate_frame(frame, read_complete)
             with self.frame_lock:
                 self.latest_frame = frame.copy()
                 self.latest_frame_time = read_complete
+            self.sync_lock_state_from_status()
             return True
         return False
 
@@ -531,12 +600,34 @@ class CameraSetup:
             return False
 
         frame, frame_time = self.get_latest_frame_packet()
+        now = time.monotonic()
         if frame is None:
+            self._log_frame_stall_warning(
+                f"{self.name or self.cam_id}: no video frame available for recording; the camera may be disconnected or stalled."
+            )
             return False
 
-        timestamp = 0.0 if self.start_time is None else max(0.0, frame_time - self.start_time)
+        timestamp = self.session_clock.stamp() if self.session_clock is not None else 0.0
         self.writer.write(frame)
-        now = time.time()
+        stall_threshold = max(1.0, 3.0 * self.record_interval_s)
+        if frame_time is not None:
+            frame_age = now - frame_time
+            if self.last_written_frame_time is not None and frame_time <= self.last_written_frame_time:
+                self.repeated_frame_write_count += 1
+            else:
+                self.repeated_frame_write_count = 0
+            if frame_age >= stall_threshold:
+                if self.repeated_frame_write_count >= 3:
+                    self._log_frame_stall_warning(
+                        f"{self.name or self.cam_id}: repeated video frame timestamps detected for {self.repeated_frame_write_count} consecutive writes (frame age {frame_age:.2f}s, threshold {stall_threshold:.2f}s). The camera may be stalled or the buffer is not advancing."
+                    )
+                else:
+                    self._log_frame_stall_warning(
+                        f"{self.name or self.cam_id}: latest video frame is {frame_age:.2f}s old while recording (threshold {stall_threshold:.2f}s). The camera may be stalled or dropping frames."
+                    )
+        else:
+            self.repeated_frame_write_count = 0
+        self.last_written_frame_time = frame_time
         if self.last_write_time is not None:
             delta = now - self.last_write_time
             if delta > 0:
@@ -567,7 +658,18 @@ class CameraSetup:
             return None
         brake_raw, wheel_pos, mode = parts
         brake_text = "locked" if brake_raw == "0" else "unlocked" if brake_raw == "1" else brake_raw
-        return (brake_text, wheel_pos, mode)
+        return (brake_text, wheel_pos, normalize_lock_state(mode) or mode)
+
+    def sync_lock_state_from_status(self):
+        if self.lock_state_synced_from_hardware or self.lock_state_user_overridden or self.latest_status is None:
+            return False
+        mode = normalize_lock_state(self.latest_status[2])
+        if mode is None:
+            return False
+        changed = self.lock_state != mode
+        self.lock_state = mode
+        self.lock_state_synced_from_hardware = True
+        return changed
 
     def send_lock_state(self, log_fn=None):
         command_map = {
@@ -917,36 +1019,55 @@ class App:
         self.duration_entry.pack()
 
         media_frame = ttk.Frame(self.root)
-        media_frame.pack(padx=10, pady=10)
+        media_frame.pack(fill="x", padx=10, pady=10)
+        media_frame.grid_columnconfigure(0, weight=0)
+        media_frame.grid_columnconfigure(1, weight=1)
+
+        button_style = ttk.Style(self.root)
+        button_style.configure("App.Big.TButton", padding=(12, 7))
+        button_style.configure("App.Big.TCheckbutton", padding=(10, 5))
+        button_style.configure("App.Compact.TButton", padding=(5, 2))
 
         tune_frame = ttk.LabelFrame(media_frame, text="Camera Tuning")
-        tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 15))
+        tune_frame.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        self.camera_settings_visible = True
 
-        ttk.Label(tune_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
-        self.exposure_value_entry = ttk.Entry(tune_frame, width=12)
+        self.camera_settings_toggle_button = ttk.Button(
+            tune_frame,
+            text="Hide Settings",
+            command=self.toggle_camera_settings_visibility,
+            style="App.Compact.TButton",
+        )
+        self.camera_settings_toggle_button.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 3))
+
+        self.camera_settings_frame = ttk.Frame(tune_frame)
+        self.camera_settings_frame.grid(row=1, column=0, columnspan=2, sticky="nw", padx=4, pady=(0, 6))
+
+        ttk.Label(self.camera_settings_frame, text="Exposure").grid(row=0, column=0, sticky="w", pady=(10, 0))
+        self.exposure_value_entry = ttk.Entry(self.camera_settings_frame, width=12)
         self.exposure_value_entry.grid(row=1, column=0, sticky="ew")
-        self.exposure_apply_button = ttk.Button(tune_frame, text="Apply Exposure", command=lambda: self.apply_value_from_entry("Exposure"))
+        self.exposure_apply_button = ttk.Button(self.camera_settings_frame, text="Apply Exposure", command=lambda: self.apply_value_from_entry("Exposure"), style="App.Big.TButton")
         self.exposure_apply_button.grid(row=1, column=1, padx=(8, 0), sticky="ew")
-        self.exposure_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.exposure_range_label = ttk.Label(self.camera_settings_frame, text="Range: --", font=self.small_font)
         self.exposure_range_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(tune_frame, text="Gain").grid(row=3, column=0, sticky="w", pady=(14, 0))
-        self.gain_value_entry = ttk.Entry(tune_frame, width=12)
+        ttk.Label(self.camera_settings_frame, text="Gain").grid(row=3, column=0, sticky="w", pady=(14, 0))
+        self.gain_value_entry = ttk.Entry(self.camera_settings_frame, width=12)
         self.gain_value_entry.grid(row=4, column=0, sticky="ew")
-        self.gain_apply_button = ttk.Button(tune_frame, text="Apply Gain", command=lambda: self.apply_value_from_entry("Gain"))
+        self.gain_apply_button = ttk.Button(self.camera_settings_frame, text="Apply Gain", command=lambda: self.apply_value_from_entry("Gain"), style="App.Big.TButton")
         self.gain_apply_button.grid(row=4, column=1, padx=(8, 0), sticky="ew")
-        self.gain_range_label = ttk.Label(tune_frame, text="Range: --", font=self.small_font)
+        self.gain_range_label = ttk.Label(self.camera_settings_frame, text="Range: --", font=self.small_font)
         self.gain_range_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        self.refresh_camera_settings_button = ttk.Button(tune_frame, text="Refresh Camera Values", command=self.update_camera_settings_label)
+        self.refresh_camera_settings_button = ttk.Button(self.camera_settings_frame, text="Refresh Camera Values", command=self.update_camera_settings_label, style="App.Big.TButton")
         self.refresh_camera_settings_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
-        self.camera_settings_label = ttk.Label(tune_frame, text="Exposure: -- | Gain: --", font=self.small_font, cursor="hand2")
+        self.camera_settings_label = ttk.Label(self.camera_settings_frame, text="Exposure: -- | Gain: --", font=self.small_font, cursor="hand2")
         self.camera_settings_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(15, 0))
         self.camera_settings_label.bind("<Double-Button-1>", self.prompt_set_exposure_and_gain)
 
         self.video_panel = ttk.Label(media_frame)
-        self.video_panel.grid(row=0, column=1, sticky="n")
+        self.video_panel.grid(row=0, column=1, sticky="")
 
         self.fps_label = ttk.Label(self.root, text="FPS: --", font=self.small_font)
         self.fps_label.pack()
@@ -970,19 +1091,19 @@ class App:
         button_frame = ttk.Frame(control_frame)
         button_frame.pack()
 
-        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_recording)
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_recording, style="App.Big.TButton")
         self.start_button.grid(row=0, column=0)
-        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording)
+        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording, style="App.Big.TButton")
         self.stop_button.grid(row=0, column=1)
-        self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup)
+        self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup, style="App.Big.TButton")
         self.left_button.grid(row=0, column=2)
-        self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup)
+        self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup, style="App.Big.TButton")
         self.right_button.grid(row=0, column=3)
-        self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system)
+        self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system, style="App.Big.TButton")
         self.test_button.grid(row=0, column=4, padx=(10, 0))
 
         self.auto_cycle_var = tk.BooleanVar()
-        self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle)
+        self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle, style="App.Big.TCheckbutton")
         self.auto_cycle_button.grid(row=0, column=5)
 
         self.dwell_label = ttk.Label(button_frame, text="Dwell (s):")
@@ -991,15 +1112,34 @@ class App:
         self.dwell_entry.insert(0, "5")
         self.dwell_entry.grid(row=0, column=7)
 
-        self.lock_state_button = tk.Button(button_frame, text="Automatic", command=self.toggle_lock_state, bg="blue", fg="white")
-        self.lock_state_button.grid(row=1, column=0, columnspan=8, pady=(10, 0))
+        self.lock_state_control_frame = ttk.LabelFrame(button_frame, text="Lock mode")
+        self.lock_state_control_frame.grid(row=1, column=0, columnspan=8, pady=(10, 0), sticky="ew")
+        for idx in range(3):
+            self.lock_state_control_frame.columnconfigure(idx, weight=1)
+
+        self.lock_state_buttons = {}
+        for idx, state in enumerate(LOCK_STATE_SEQUENCE):
+            label, _bg, _fg = LOCK_STATE_COLORS[state]
+            button = tk.Button(
+                self.lock_state_control_frame,
+                text=label,
+                command=lambda s=state: self.set_lock_state(s),
+                padx=8,
+                pady=3,
+                relief="raised",
+                bd=1,
+                highlightthickness=0,
+                takefocus=False,
+            )
+            button.grid(row=0, column=idx, padx=3, pady=2, sticky="ew")
+            self.lock_state_buttons[state] = button
 
         self.fps_label_entry = ttk.Label(button_frame, text="FPS:")
         self.fps_label_entry.grid(row=2, column=0, sticky="e", pady=(10, 0))
         self.fps_entry = ttk.Entry(button_frame, width=6)
         self.fps_entry.insert(0, str(self.record_fps))
         self.fps_entry.grid(row=2, column=1, pady=(10, 0))
-        self.fps_apply_button = ttk.Button(button_frame, text="Apply FPS", command=self.apply_fps)
+        self.fps_apply_button = ttk.Button(button_frame, text="Apply FPS", command=self.apply_fps, style="App.Big.TButton")
         self.fps_apply_button.grid(row=2, column=2, columnspan=2, padx=(5, 0), pady=(10, 0))
 
         self.debug_var = tk.BooleanVar()
@@ -1007,13 +1147,14 @@ class App:
         self.debug_checkbox.grid(row=1, column=8, padx=(10, 0), pady=(10, 0))
         self.update_setup_label()
         self.update_lock_state_button()
+        self._update_camera_settings_toggle_button()
         self.update_camera_settings_label()
         self.last_display_time = None
         self.last_display_fps = None
 
     def update_video(self):
         setup = self.setups[self.current_setup]
-        now = time.time()
+        now = time.monotonic()
         if self.last_display_time is not None:
             delta = now - self.last_display_time
             if delta > 0:
@@ -1037,7 +1178,12 @@ class App:
             self.debug_log(f"{setup.name}: {setup.last_arduino_line}")
             setup.last_logged_arduino_line = setup.last_arduino_line
 
-        elapsed = setup.elapsed_time if setup.recording else 0
+        self.update_lock_state_button()
+
+        elapsed = 0
+        if setup.recording and setup.session_clock is not None:
+            elapsed = int(setup.session_clock.elapsed())
+            setup.elapsed_time = elapsed
         remaining = max(0, (setup.session_duration * 60) - elapsed)
         elapsed_str = f"{elapsed // 60}:{elapsed % 60:02d}"
         remaining_str = f"{remaining // 60}:{remaining % 60:02d}"
@@ -1092,6 +1238,20 @@ class App:
         self.frame_interval_ms = int(1000.0 / fps)
         if any(setup.recording for setup in self.setups):
             messagebox.showinfo("FPS Updated", "Display FPS updated now. Video FPS will apply on next recording.")
+
+    def toggle_camera_settings_visibility(self):
+        self.camera_settings_visible = not self.camera_settings_visible
+        if self.camera_settings_visible:
+            self.camera_settings_frame.grid()
+        else:
+            self.camera_settings_frame.grid_remove()
+        self._update_camera_settings_toggle_button()
+
+    def _update_camera_settings_toggle_button(self):
+        if hasattr(self, "camera_settings_toggle_button"):
+            self.camera_settings_toggle_button.config(
+                text="Hide Settings" if self.camera_settings_visible else "Show Settings"
+            )
 
     def persist_setup_capture_settings(self, setup):
         config = configparser.ConfigParser()
@@ -1267,6 +1427,8 @@ class App:
     def start_setup_recording(self, setup, mouse_id, session_duration, exp_id):
         setup.exp_id = exp_id
         setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
+        setup.sync_lock_state_from_status()
+        self.update_lock_state_button()
         setup.send_lock_state(log_fn=self.debug_log)
 
     def start_test_system(self):
@@ -1319,22 +1481,38 @@ class App:
 
     def update_lock_state_button(self):
         setup = self.setups[self.current_setup]
-        color_map = {
-            "automatic": ("Automatic", "blue", "white"),
-            "unlocked": ("Unlocked", "green", "white"),
-            "locked": ("Locked", "red", "white"),
-        }
-        label, bg, fg = color_map.get(setup.lock_state, ("Automatic", "blue", "white"))
-        self.lock_state_button.config(text=label, bg=bg, fg=fg)
+        setup.sync_lock_state_from_status()
+        state = normalize_lock_state(setup.lock_state) or "automatic"
+        for candidate_state, button in getattr(self, "lock_state_buttons", {}).items():
+            label, _bg, _fg = LOCK_STATE_COLORS[candidate_state]
+            if candidate_state == state:
+                active_bg, active_fg = LOCK_STATE_COLORS[state][1:]
+                button.config(
+                    text=label,
+                    bg=active_bg,
+                    fg=active_fg,
+                    relief="sunken",
+                    bd=3,
+                    activebackground=active_bg,
+                    activeforeground=active_fg,
+                )
+            else:
+                button.config(
+                    text=label,
+                    bg=LOCK_STATE_INACTIVE_BG,
+                    fg=LOCK_STATE_INACTIVE_FG,
+                    relief="raised",
+                    bd=2,
+                    activebackground=LOCK_STATE_INACTIVE_BG,
+                    activeforeground=LOCK_STATE_INACTIVE_FG,
+                )
 
-    def toggle_lock_state(self):
+    def set_lock_state(self, state):
         setup = self.setups[self.current_setup]
-        if setup.lock_state == "automatic":
-            setup.lock_state = "unlocked"
-        elif setup.lock_state == "unlocked":
-            setup.lock_state = "locked"
-        else:
-            setup.lock_state = "automatic"
+        normalized_state = normalize_lock_state(state) or "automatic"
+        setup.lock_state_user_overridden = True
+        setup.lock_state_synced_from_hardware = True
+        setup.lock_state = normalized_state
         setup.send_lock_state(log_fn=self.debug_log)
         self.update_lock_state_button()
 
@@ -1439,6 +1617,7 @@ class App:
         self.duration_entry.insert(0, str(setup.session_duration))
         self.update_setup_label()
         self.update_lock_state_button()
+        self._update_camera_settings_toggle_button()
         self.update_camera_settings_label()
 
     def on_closing(self):
