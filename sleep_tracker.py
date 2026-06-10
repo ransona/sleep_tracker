@@ -109,18 +109,25 @@ def append_exp_list(exp_list_dir, exp_id):
 class SessionClock:
     """Recorder-owned monotonic clock shared by the video and CSV outputs."""
 
-    def __init__(self, fps: float):
-        self.reset(fps)
+    def __init__(self):
+        self.start_time = None
 
-    def reset(self, fps: float):
-        self.fps = max(float(fps), 0.1)
-        self.step_s = 1.0 / self.fps
-        self.frame_index = 0
+    def start(self):
+        self.start_time = time.monotonic()
 
-    def stamp(self) -> float:
-        timestamp = self.frame_index * self.step_s
-        self.frame_index += 1
-        return timestamp
+    def elapsed(self, now=None) -> float:
+        if self.start_time is None:
+            return 0.0
+        if now is None:
+            now = time.monotonic()
+        return max(0.0, now - self.start_time)
+
+    def stamp(self, event_time=None) -> float:
+        if self.start_time is None:
+            return 0.0
+        if event_time is None:
+            event_time = time.monotonic()
+        return max(0.0, event_time - self.start_time)
 
 
 # Simulated Arduino for fallback when real one is not found
@@ -410,6 +417,9 @@ class CameraSetup:
         self.serial_lock = threading.Lock()
         self.last_write_time = None
         self.last_write_fps = None
+        self.last_stall_warning_time = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
         self.last_read_complete_time = None
         self.last_effective_fps = None
         self.record_interval_s = 0.1
@@ -472,9 +482,13 @@ class CameraSetup:
         self.session_duration = session_duration
         self.record_fps = max(record_fps, 0.1)
         self.record_interval_s = 1.0 / self.record_fps
-        self.session_clock = SessionClock(self.record_fps)
+        self.session_clock = SessionClock()
+        self.session_clock.start()
         self.last_write_time = None
         self.last_write_fps = None
+        self.last_stall_warning_time = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
         self.elapsed_time = 0
         output_id = self.name or f"camera_{self.cam_id}"
         video_path, csv_path = generate_file_paths(mouse_id, exp_id, output_id, self.root_dir)
@@ -504,6 +518,8 @@ class CameraSetup:
             self.csv_file = None
         self.csv_writer = None
         self.session_clock = None
+        self.last_written_frame_time = None
+        self.repeated_frame_write_count = 0
 
     def stop_background_recording(self):
         self.recording_stop_event.set()
@@ -513,12 +529,21 @@ class CameraSetup:
 
     def recording_loop(self):
         while not self.recording_stop_event.is_set() and self.recording:
-            loop_start = time.time()
+            loop_start = time.monotonic()
             self.write_latest_frame()
-            elapsed = time.time() - loop_start
+            elapsed = time.monotonic() - loop_start
             sleep_s = self.record_interval_s - elapsed
             if sleep_s > 0:
                 self.recording_stop_event.wait(sleep_s)
+
+    def _log_frame_stall_warning(self, message):
+        now = time.monotonic()
+        cooldown_s = 5.0
+        if self.last_stall_warning_time is not None and (now - self.last_stall_warning_time) < cooldown_s:
+            return False
+        self.last_stall_warning_time = now
+        self._log(message, level="WARNING")
+        return True
 
     def apply_flips(self, frame):
         if self.flip_horizontal:
@@ -531,23 +556,23 @@ class CameraSetup:
         return frame
 
     def poll_capture(self):
-        frame_start = time.time()
+        frame_start = time.monotonic()
         with self.capture_lock:
             if self.cap is None:
                 return False
             ret, frame = self.cap.read()
-        read_complete = time.time()
+        read_complete = time.monotonic()
         self.last_frame_ms = (read_complete - frame_start) * 1000.0
         self.update_fps_diagnostic(read_complete, ret)
         arduino_data = ""
-        serial_start = time.time()
+        serial_start = time.monotonic()
         with self.serial_lock:
             while self.serial.in_waiting:
                 arduino_data = self.serial.readline().decode().strip()
             if arduino_data:
                 self.latest_status = self.parse_arduino_status(arduino_data)
                 self.last_arduino_line = arduino_data
-        self.last_serial_ms = (time.time() - serial_start) * 1000.0
+        self.last_serial_ms = (time.monotonic() - serial_start) * 1000.0
         if ret:
             frame = self.apply_flips(frame)
             frame = self.annotate_frame(frame, read_complete)
@@ -574,13 +599,35 @@ class CameraSetup:
         if not self.recording or self.writer is None or self.csv_writer is None:
             return False
 
-        frame, _ = self.get_latest_frame_packet()
+        frame, frame_time = self.get_latest_frame_packet()
+        now = time.monotonic()
         if frame is None:
+            self._log_frame_stall_warning(
+                f"{self.name or self.cam_id}: no video frame available for recording; the camera may be disconnected or stalled."
+            )
             return False
 
         timestamp = self.session_clock.stamp() if self.session_clock is not None else 0.0
         self.writer.write(frame)
-        now = time.time()
+        stall_threshold = max(1.0, 3.0 * self.record_interval_s)
+        if frame_time is not None:
+            frame_age = now - frame_time
+            if self.last_written_frame_time is not None and frame_time <= self.last_written_frame_time:
+                self.repeated_frame_write_count += 1
+            else:
+                self.repeated_frame_write_count = 0
+            if frame_age >= stall_threshold:
+                if self.repeated_frame_write_count >= 3:
+                    self._log_frame_stall_warning(
+                        f"{self.name or self.cam_id}: repeated video frame timestamps detected for {self.repeated_frame_write_count} consecutive writes (frame age {frame_age:.2f}s, threshold {stall_threshold:.2f}s). The camera may be stalled or the buffer is not advancing."
+                    )
+                else:
+                    self._log_frame_stall_warning(
+                        f"{self.name or self.cam_id}: latest video frame is {frame_age:.2f}s old while recording (threshold {stall_threshold:.2f}s). The camera may be stalled or dropping frames."
+                    )
+        else:
+            self.repeated_frame_write_count = 0
+        self.last_written_frame_time = frame_time
         if self.last_write_time is not None:
             delta = now - self.last_write_time
             if delta > 0:
@@ -1107,7 +1154,7 @@ class App:
 
     def update_video(self):
         setup = self.setups[self.current_setup]
-        now = time.time()
+        now = time.monotonic()
         if self.last_display_time is not None:
             delta = now - self.last_display_time
             if delta > 0:
@@ -1133,7 +1180,10 @@ class App:
 
         self.update_lock_state_button()
 
-        elapsed = setup.elapsed_time if setup.recording else 0
+        elapsed = 0
+        if setup.recording and setup.session_clock is not None:
+            elapsed = int(setup.session_clock.elapsed())
+            setup.elapsed_time = elapsed
         remaining = max(0, (setup.session_duration * 60) - elapsed)
         elapsed_str = f"{elapsed // 60}:{elapsed % 60:02d}"
         remaining_str = f"{remaining // 60}:{remaining % 60:02d}"
