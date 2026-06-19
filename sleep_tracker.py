@@ -419,6 +419,7 @@ class CameraSetup:
         self.mouse_id = ""
         self.session_duration = 0  # in minutes
         self.exp_id = ""
+        self.remote_exp_dir = None
         self.lock_state = "automatic"
         self.lock_state_synced_from_hardware = False
         self.lock_state_user_overridden = False
@@ -1111,22 +1112,24 @@ class App:
         self.start_button.grid(row=0, column=0)
         self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_recording, style="App.Big.TButton")
         self.stop_button.grid(row=0, column=1)
+        self.discard_button = ttk.Button(button_frame, text="Discard", command=self.discard_recording, style="App.Big.TButton")
+        self.discard_button.grid(row=0, column=2)
         self.left_button = ttk.Button(button_frame, text="<", command=self.prev_setup, style="App.Big.TButton")
-        self.left_button.grid(row=0, column=2)
+        self.left_button.grid(row=0, column=3)
         self.right_button = ttk.Button(button_frame, text=">", command=self.next_setup, style="App.Big.TButton")
-        self.right_button.grid(row=0, column=3)
+        self.right_button.grid(row=0, column=4)
         self.test_button = ttk.Button(button_frame, text="Test system", command=self.start_test_system, style="App.Big.TButton")
-        self.test_button.grid(row=0, column=4, padx=(10, 0))
+        self.test_button.grid(row=0, column=5, padx=(10, 0))
 
         self.auto_cycle_var = tk.BooleanVar()
         self.auto_cycle_button = ttk.Checkbutton(button_frame, text="Auto Cycle", variable=self.auto_cycle_var, command=self.toggle_auto_cycle, style="App.Big.TCheckbutton")
-        self.auto_cycle_button.grid(row=0, column=5)
+        self.auto_cycle_button.grid(row=0, column=6)
 
         self.dwell_label = ttk.Label(button_frame, text="Dwell (s):")
-        self.dwell_label.grid(row=0, column=6)
+        self.dwell_label.grid(row=0, column=7)
         self.dwell_entry = ttk.Entry(button_frame, width=5)
         self.dwell_entry.insert(0, "5")
-        self.dwell_entry.grid(row=0, column=7)
+        self.dwell_entry.grid(row=0, column=8)
 
         self.lock_state_control_frame = ttk.LabelFrame(button_frame, text="Lock mode")
         self.lock_state_control_frame.grid(row=1, column=0, columnspan=8, pady=(10, 0), sticky="ew")
@@ -1434,14 +1437,44 @@ class App:
                 return
 
         exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
-        self.start_setup_recording(setup, mouse_id, session_duration, exp_id)
+        self.start_setup_recording(setup, mouse_id, session_duration, exp_id, remote_exp_dir)
         self.update_setup_label()
 
     def stop_recording(self):
         self.setups[self.current_setup].stop_recording()
 
-    def start_setup_recording(self, setup, mouse_id, session_duration, exp_id):
+    def discard_recording(self):
+        setup = self.setups[self.current_setup]
+        if not setup.recording:
+            messagebox.showinfo("Nothing to Discard", f"{setup.name}: no experiment is recording.")
+            return
+        if not messagebox.askyesno(
+            "Confirm Discard",
+            f"Discard experiment '{setup.exp_id}'?\n\nThis will stop recording and mark the remote experiment for deletion.",
+            parent=self.root,
+        ):
+            return
+
+        try:
+            if not setup.remote_exp_dir:
+                raise RuntimeError("no remote experiment directory is registered")
+            marker_path = os.path.join(setup.remote_exp_dir, "deleteme")
+            with open(marker_path, "w", encoding="utf-8"):
+                pass
+            self.log(f"Marked experiment '{setup.exp_id}' for deletion: {marker_path}", level="WARNING")
+        except Exception as exc:
+            self.log(f"Failed to mark experiment '{setup.exp_id}' for deletion: {exc}", level="ERROR")
+            messagebox.showerror(
+                "Discard Marker Failed",
+                f"Recording will stop, but the remote experiment was not marked for deletion:\n\n{exc}",
+                parent=self.root,
+            )
+        finally:
+            setup.stop_recording()
+
+    def start_setup_recording(self, setup, mouse_id, session_duration, exp_id, remote_exp_dir=None):
         setup.exp_id = exp_id
+        setup.remote_exp_dir = remote_exp_dir
         setup.start_recording(mouse_id, session_duration, exp_id, record_fps=self.record_fps)
         setup.sync_lock_state_from_status()
         self.update_lock_state_button()
@@ -1457,9 +1490,9 @@ class App:
 
         exp_ids = []
         for setup in self.setups:
-            exp_id, _remote_exp_dir = self.generate_and_register_exp(mouse_id)
+            exp_id, remote_exp_dir = self.generate_and_register_exp(mouse_id)
             self.ensure_setup_capture(setup)
-            self.start_setup_recording(setup, mouse_id, session_duration, exp_id)
+            self.start_setup_recording(setup, mouse_id, session_duration, exp_id, remote_exp_dir)
             exp_ids.append(f"{setup.name or setup.cam_id}={exp_id}")
         self.log(
             (
