@@ -84,7 +84,7 @@ Inside this folder:
 
 setupX.mp4: The recorded video.
 
-setupX.csv: A log of timestamps and Arduino data.
+setupX.csv: A log of shared-session timestamps and Arduino data.
 
 ⚠️ Notes
 
