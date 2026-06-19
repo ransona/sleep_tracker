@@ -18,6 +18,7 @@ DEFAULT_SIMULATE = False
 DEFAULT_REMOTE_REPOSITORY_ROOT = "/data/Remote_Repository"
 PIPELINE_USER = "machine-pipeline-access"
 FILE_CHECK_NAME = "file_check_habituate.txt"
+DISCARD_MARKER_NAME = "deleteme"
 
 try:
     from preprocess_pipeline.step1 import run_batch
@@ -163,6 +164,11 @@ def exp_root_from_id(exp_id: str, remote_repository_root: str) -> str:
     return os.path.join(remote_repository_root, animal_id, exp_id)
 
 
+def exp_is_discarded(exp_id: str, cfg: WatcherConfig) -> bool:
+    exp_root = exp_root_from_id(exp_id, cfg.remote_repository_root)
+    return os.path.isfile(os.path.join(exp_root, DISCARD_MARKER_NAME))
+
+
 def parse_file_check(path: str) -> Tuple[int, List[Tuple[str, int]]]:
     with open(path, "r") as f:
         lines = [line.strip() for line in f if line.strip()]
@@ -262,6 +268,15 @@ def run_loop(cfg: WatcherConfig) -> None:
                 logger.info("Found %d new experiment IDs", len(new_ids))
             for exp_id in new_ids:
                 try:
+                    if exp_is_discarded(exp_id, cfg):
+                        logger.info(
+                            "Skipping discarded experiment ID %s: found %s in experiment root",
+                            exp_id,
+                            DISCARD_MARKER_NAME,
+                        )
+                        append_processed(cfg.processed_list_path, exp_id)
+                        processed.add(exp_id)
+                        continue
                     ready, reason = exp_data_ready(exp_id, cfg)
                     if not ready:
                         logger.info(
@@ -269,6 +284,15 @@ def run_loop(cfg: WatcherConfig) -> None:
                             exp_id,
                             reason,
                         )
+                        continue
+                    if exp_is_discarded(exp_id, cfg):
+                        logger.info(
+                            "Skipping discarded experiment ID %s: found %s in experiment root",
+                            exp_id,
+                            DISCARD_MARKER_NAME,
+                        )
+                        append_processed(cfg.processed_list_path, exp_id)
+                        processed.add(exp_id)
                         continue
                     enqueue_exp(logger, exp_id, cfg.simulate)
                     append_processed(cfg.processed_list_path, exp_id)

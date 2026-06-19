@@ -117,6 +117,7 @@ Behavior:
 - Reads exp IDs from the CSV first column.
 - Resolves each experiment folder as `remote_repository_root/[animalID]/[expID]`.
 - Requires `file_check_habituate.txt` to exist and match the listed file sizes before queueing.
+- Skips experiments whose root contains a `deleteme` marker and records them as processed so they are not reconsidered on later polls.
 - Leaves incomplete experiments unprocessed so they are retried on later polls.
 - Between polls, shows a countdown in the terminal and lets an interactive user press Enter to poll immediately.
 - For each new ID, builds `step1_config` with:
