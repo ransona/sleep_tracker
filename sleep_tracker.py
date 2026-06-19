@@ -10,6 +10,7 @@ import serial
 import os
 import csv
 import configparser
+import json
 import winreg
 from datetime import datetime
 from PIL import Image, ImageTk
@@ -74,6 +75,20 @@ def generate_file_paths(mouse_id, exp_id, setup_index, root_dir):
     return video_path, csv_path
 
 
+def write_experiment_metadata(exp_id, animal_id, exp_dir):
+    """Write remote experiment metadata expected by the pipeline."""
+    metadata_path = os.path.join(exp_dir, f"{exp_id}_experiment_metadata.json")
+    metadata = {
+        "expID": exp_id,
+        "animalID": animal_id,
+        "user": "machine-pipeline-access",
+        "description": "habituation",
+        "created_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z"),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file)
+
+
 def create_exp_id(mouse_id, remote_repo):
     """
     Replicate the MATLAB newExpID logic:
@@ -94,6 +109,7 @@ def create_exp_id(mouse_id, remote_repo):
         candidate_dir = os.path.join(animal_dir, possible_exp_id)
         if not os.path.exists(candidate_dir):
             os.makedirs(candidate_dir, exist_ok=True)
+            write_experiment_metadata(possible_exp_id, safe_mouse_id, candidate_dir)
             return possible_exp_id, candidate_dir
 
 
