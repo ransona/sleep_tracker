@@ -1,0 +1,156 @@
+[
+  {
+    "section": "Probe",
+    "camera_id": 0,
+    "backend_used": "DSHOW",
+    "opened": true,
+    "properties": {
+      "AutoExposure": {
+        "original": -1.0,
+        "restore_ok": true,
+        "restored": -1.0,
+        "distinct_reported_values": [
+          -1.0
+        ],
+        "observations": [
+          {
+            "requested": 0.0,
+            "set_ok": true,
+            "reported": -1.0
+          },
+          {
+            "requested": 0.25,
+            "set_ok": true,
+            "reported": -1.0
+          },
+          {
+            "requested": 0.5,
+            "set_ok": true,
+            "reported": -1.0
+          },
+          {
+            "requested": 0.75,
+            "set_ok": true,
+            "reported": -1.0
+          },
+          {
+            "requested": 1.0,
+            "set_ok": true,
+            "reported": -1.0
+          }
+        ]
+      },
+      "Exposure": {
+        "original": -5.0,
+        "restore_ok": true,
+        "restored": -5.0,
+        "distinct_reported_values": [
+          -13.0,
+          -11.0,
+          -9.0,
+          -7.0,
+          -5.0,
+          -3.0,
+          -1.0,
+          0.0
+        ],
+        "observations": [
+          {
+            "requested": -13.0,
+            "set_ok": true,
+            "reported": -13.0
+          },
+          {
+            "requested": -11.0,
+            "set_ok": true,
+            "reported": -11.0
+          },
+          {
+            "requested": -9.0,
+            "set_ok": true,
+            "reported": -9.0
+          },
+          {
+            "requested": -7.0,
+            "set_ok": true,
+            "reported": -7.0
+          },
+          {
+            "requested": -5.0,
+            "set_ok": true,
+            "reported": -5.0
+          },
+          {
+            "requested": -3.0,
+            "set_ok": true,
+            "reported": -3.0
+          },
+          {
+            "requested": -1.0,
+            "set_ok": true,
+            "reported": -1.0
+          },
+          {
+            "requested": 0.0,
+            "set_ok": true,
+            "reported": 0.0
+          }
+        ]
+      },
+      "Gain": {
+        "original": 0.0,
+        "restore_ok": true,
+        "restored": 0.0,
+        "distinct_reported_values": [
+          0.0,
+          4.0
+        ],
+        "observations": [
+          {
+            "requested": 0.0,
+            "set_ok": true,
+            "reported": 0.0
+          },
+          {
+            "requested": 4.0,
+            "set_ok": true,
+            "reported": 4.0
+          },
+          {
+            "requested": 8.0,
+            "set_ok": false,
+            "reported": 4.0
+          },
+          {
+            "requested": 16.0,
+            "set_ok": false,
+            "reported": 4.0
+          },
+          {
+            "requested": 32.0,
+            "set_ok": false,
+            "reported": 4.0
+          },
+          {
+            "requested": 64.0,
+            "set_ok": false,
+            "reported": 4.0
+          },
+          {
+            "requested": 128.0,
+            "set_ok": false,
+            "reported": 4.0
+          },
+          {
+            "requested": 255.0,
+            "set_ok": false,
+            "reported": 4.0
+          }
+        ]
+      }
+    },
+    "frame_width": 640.0,
+    "frame_height": 480.0,
+    "fps": 0.0
+  }
+]

@@ -1,0 +1,30 @@
+[
+  {
+    "section": "Setup 1",
+    "camera_id": 4,
+    "backend_used": "DEFAULT",
+    "opened": false,
+    "properties": {}
+  },
+  {
+    "section": "Setup 2",
+    "camera_id": 1,
+    "backend_used": "DEFAULT",
+    "opened": false,
+    "properties": {}
+  },
+  {
+    "section": "Setup 3",
+    "camera_id": 3,
+    "backend_used": "DEFAULT",
+    "opened": false,
+    "properties": {}
+  },
+  {
+    "section": "Setup 4",
+    "camera_id": 2,
+    "backend_used": "DEFAULT",
+    "opened": false,
+    "properties": {}
+  }
+]
